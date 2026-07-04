@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 use crate::protocol::{ClientMsg, ServerMsg};
 use crate::rooms::RoomManager;
-   use crate::game::rules::{validate_play, resolve_trick, end_game, check_trick_complete, process_bot_turns, non_participants};
+use crate::game::rules::{validate_play, resolve_trick, end_game, check_trick_complete, non_participants, process_one_bot_turn};
 use crate::game::state::GamePhase;
 use crate::game::combo;
 
@@ -273,9 +273,7 @@ async fn handle_play(
 
     if let Some(winner) = check_trick_complete(&state) {
         resolve_trick(&mut state, winner);
-        if !end_game(&mut state) {
-            process_bot_turns(&mut state);
-        } else {
+        if end_game(&mut state) {
             for i in 0..4 {
                 if !state.players[i].finished {
                     state.finished_order.push(i);
@@ -293,17 +291,12 @@ async fn handle_play(
         }
         state.phase = GamePhase::GameOver;
     } else {
-        let mut next = (state.current_player + 1) % 4;
-        while state.players[next].finished {
-            next = (next + 1) % 4;
-        }
-        state.current_player = next;
-        process_bot_turns(&mut state);
+        state.current_player = (state.current_player + 1) % 4;
     }
 
     rooms.update_state(code, state.clone());
     broadcast_state(rooms, code);
-    eprintln!("[PLAY] Done for player {}", player_id);
+    process_bot_turns_delayed(rooms, code).await;
 }
 
 async fn handle_pass(
@@ -355,9 +348,7 @@ async fn handle_pass(
     if non_participants(&state) >= 3 {
         if let Some(winner) = state.trick.combo_player {
             resolve_trick(&mut state, winner);
-            if !end_game(&mut state) {
-                process_bot_turns(&mut state);
-            } else {
+            if end_game(&mut state) {
                 for i in 0..4 {
                     if !state.players[i].finished {
                         state.finished_order.push(i);
@@ -376,15 +367,34 @@ async fn handle_pass(
         }
         state.phase = GamePhase::GameOver;
     } else {
-        let mut next = (state.current_player + 1) % 4;
-        while state.players[next].finished {
-            next = (next + 1) % 4;
-        }
-        state.current_player = next;
-        eprintln!("[PASS] Next player: {}, is_bot: {}", next, state.players[next].is_bot);
-        process_bot_turns(&mut state);
+        state.current_player = (state.current_player + 1) % 4;
     }
 
+    rooms.update_state(code, state.clone());
+    broadcast_state(rooms, code);
+    process_bot_turns_delayed(rooms, code).await;
+}
+
+async fn process_bot_turns_delayed(rooms: &Arc<RoomManager>, code: &str) {
+    loop {
+        let mut state = match rooms.get_state(code) {
+            Some(s) if s.phase == GamePhase::Playing => s,
+            _ => return,
+        };
+        let needs_more = process_one_bot_turn(&mut state);
+        rooms.update_state(code, state.clone());
+        broadcast_state(rooms, code);
+        if !needs_more {
+            break;
+        }
+        let delay_ms = rooms.get_bot_turn_delay_ms();
+        actix_web::rt::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+    let mut state = match rooms.get_state(code) {
+        Some(s) if s.phase == GamePhase::Playing => s,
+        _ => return,
+    };
+    crate::game::rules::skip_finished(&mut state);
     rooms.update_state(code, state.clone());
     broadcast_state(rooms, code);
 }

@@ -73,6 +73,7 @@ pub fn resolve_trick(state: &mut GameState, winner_id: usize) {
 
     // Next trick led by winner
     state.current_player = winner_id;
+    skip_finished(state);
 }
 
 pub fn player_finished(state: &GameState, player_id: usize) -> bool {
@@ -206,21 +207,19 @@ pub fn check_trick_complete(state: &GameState) -> Option<usize> {
     None
 }
 
-/// Process all consecutive bot turns. Returns updated GameState.
-pub fn process_bot_turns(state: &mut GameState) {
+pub fn skip_finished(state: &mut GameState) {
+    while state.players[state.current_player].finished {
+        state.current_player = (state.current_player + 1) % 4;
+    }
+}
+
+/// Process a single bot turn. Returns true if another bot turn is needed.
+pub fn process_one_bot_turn(state: &mut GameState) -> bool {
     use super::bot::bot_play;
     use super::combo;
 
-    let mut iteration = 0;
-    loop {
-        iteration += 1;
-        if iteration > 100 {
-            eprintln!("[BOT_TURNS] Safety break at iteration 100");
-            break;
-        }
-
+    if state.finished_order.len() >= 3 || state.phase != GamePhase::Playing {
         if state.finished_order.len() >= 3 {
-            eprintln!("[BOT_TURNS] 3 players finished, game over!");
             state.phase = GamePhase::GameOver;
             for i in 0..4 {
                 if !state.players[i].finished {
@@ -229,161 +228,149 @@ pub fn process_bot_turns(state: &mut GameState) {
                     break;
                 }
             }
-            break;
         }
+        return false;
+    }
 
-        if state.phase != GamePhase::Playing {
-            eprintln!("[BOT_TURNS] Breaking: phase is {:?}, not Playing", state.phase);
-            break;
-        }
-
-        let cp = state.current_player;
-        if !state.players[cp].is_bot {
-            eprintln!("[BOT_TURNS] Breaking: player {} is not a bot", cp);
-            break;
-        }
-
-        eprintln!("[BOT_TURNS] Iter {}: Bot {} (hand={}) deciding...", iteration, cp, state.players[cp].hand.len());
-        eprintln!("[BOT_TURNS]   trick comboPlayer={:?}, cards={:?}", state.trick.combo_player, state.trick.cards.len());
-
+    let cp = state.current_player;
+    if !state.players[cp].is_bot {
         if state.players[cp].finished {
-            eprintln!("[BOT_TURNS] Bot {} is finished, skipping", cp);
-            let next = (state.current_player + 1) % 4;
-            state.current_player = next;
-            continue;
-        }
-
-        let decision = bot_play(state, cp);
-
-        eprintln!("[BOT_TURNS] Bot {} decision: {:?}", cp, decision.as_ref().map(|i| i.len()));
-
-        if let Some(indices) = decision {
-            let player = &state.players[cp];
-            let cards: Vec<_> = indices.iter().map(|&i| player.hand[i].clone()).collect();
-
-            let table_combo = if state.trick.combo_player.is_some() {
-                combo::detect_combo(&state.trick.cards)
-            } else {
-                None
-            };
-
-            let result = validate_play(&cards, table_combo.as_ref());
-
-            if result.valid {
-                eprintln!("[BOT_TURNS] Bot {} plays {} cards: {:?}", cp, indices.len(), cards.iter().map(|c| c.label()).collect::<Vec<_>>());
-                let card_labels: Vec<String> = cards.iter().map(|c| c.to_string()).collect();
-                state.log.push(format!("{} plays {} ({})", state.players[cp].name, card_labels.join(" "), result.combo_name));
-                let hand = &mut state.players[cp].hand;
-                for &i in indices.iter().rev() {
-                    hand.remove(i);
-                }
-
-                if state.players[cp].hand.is_empty() && !state.players[cp].finished {
-                    state.players[cp].finished = true;
-                    state.finished_order.push(cp);
-                    let pos = state.finished_order.len();
-                    state.scores[cp] = if pos == 1 { 10 } else if pos == 2 { 5 } else if pos == 3 { 0 } else { -15 };
-                    state.log.push(format!("{} finished ({}th, {} pts)", state.players[cp].name, ["", "1st", "2nd", "3rd"][pos], state.scores[cp]));
-                    eprintln!("[BOT_TURNS] Bot {} finished (empty hand), position: {}", cp, pos);
-                }
-
-                if let Some(old_cp) = state.trick.combo_player {
-                    if !state.trick.played.contains(&old_cp) && !state.trick.passed.contains(&old_cp) {
-                        state.trick.played.push(old_cp);
-                    }
-                    state.trick.passed.clear();
-                }
-                state.trick.cards = cards;
-                state.trick.combo_type = Some(result.combo.as_ref().unwrap().combo_type.clone());
-                state.trick.combo_player = Some(cp);
-
-                if let Some(winner) = check_trick_complete(state) {
-                    eprintln!("[BOT_TURNS] Trick complete! Winner: {}", winner);
-                    resolve_trick(state, winner);
-                    if end_game(state) {
-                        eprintln!("[BOT_TURNS] Game over!");
-                        for i in 0..4 {
-                            if !state.players[i].finished {
-                                state.finished_order.push(i);
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                    if state.finished_order.len() >= 3 {
-                        eprintln!("[BOT_TURNS] 3 players finished after trick, game over!");
-                        state.phase = GamePhase::GameOver;
-                        for i in 0..4 {
-                            if !state.players[i].finished {
-                                state.scores[i] = -15;
-                                state.finished_order.push(i);
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                    continue;
-                }
-            } else {
-                eprintln!("[BOT_TURNS] Bot {} play INVALID: {}", cp, result.error);
+            let finished_count = state.players.iter().filter(|p| p.finished).count();
+            if finished_count >= 3 {
+                return false;
             }
-        } else {
-            eprintln!("[BOT_TURNS] Bot {} passes", cp);
-            state.trick.passed.push(cp);
-            state.log.push(format!("{} passes", state.players[cp].name));
+            skip_finished(state);
+            return true;
+        }
+        return false;
+    }
 
-            if non_participants(state) >= 3 {
-                if let Some(winner) = state.trick.combo_player {
-                    eprintln!("[BOT_TURNS] All passed, winner: {}", winner);
-                    resolve_trick(state, winner);
-                    if end_game(state) {
-                        eprintln!("[BOT_TURNS] Game over!");
-                        for i in 0..4 {
-                            if !state.players[i].finished {
-                                state.finished_order.push(i);
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                    if state.finished_order.len() >= 3 {
-                        eprintln!("[BOT_TURNS] 3 players finished after trick, game over!");
-                        state.phase = GamePhase::GameOver;
-                        for i in 0..4 {
-                            if !state.players[i].finished {
-                                state.scores[i] = -15;
-                                state.finished_order.push(i);
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                    continue;
+    if state.players[cp].finished {
+        skip_finished(state);
+        return state.players[state.current_player].is_bot && state.phase == GamePhase::Playing;
+    }
+
+    let decision = bot_play(state, cp);
+
+    if let Some(indices) = decision {
+        let player = &state.players[cp];
+        let cards: Vec<_> = indices.iter().map(|&i| player.hand[i].clone()).collect();
+
+        let table_combo = if state.trick.combo_player.is_some() {
+            combo::detect_combo(&state.trick.cards)
+        } else {
+            None
+        };
+
+        let result = validate_play(&cards, table_combo.as_ref());
+
+        if result.valid {
+            let card_labels: Vec<String> = cards.iter().map(|c| c.to_string()).collect();
+            state.log.push(format!("{} plays {} ({})", state.players[cp].name, card_labels.join(" "), result.combo_name));
+            let hand = &mut state.players[cp].hand;
+            for &i in indices.iter().rev() {
+                hand.remove(i);
+            }
+
+            if state.players[cp].hand.is_empty() && !state.players[cp].finished {
+                state.players[cp].finished = true;
+                state.finished_order.push(cp);
+                let pos = state.finished_order.len();
+                state.scores[cp] = if pos == 1 { 10 } else if pos == 2 { 5 } else if pos == 3 { 0 } else { -15 };
+                state.log.push(format!("{} finished ({}th, {} pts)", state.players[cp].name, ["", "1st", "2nd", "3rd"][pos], state.scores[cp]));
+            }
+
+            if let Some(old_cp) = state.trick.combo_player {
+                if !state.trick.played.contains(&old_cp) && !state.trick.passed.contains(&old_cp) {
+                    state.trick.played.push(old_cp);
                 }
+                state.trick.passed.clear();
+            }
+            state.trick.cards = cards;
+            state.trick.combo_type = Some(result.combo.as_ref().unwrap().combo_type.clone());
+            state.trick.combo_player = Some(cp);
+
+            if let Some(winner) = check_trick_complete(state) {
+                resolve_trick(state, winner);
+                if end_game(state) {
+                    for i in 0..4 {
+                        if !state.players[i].finished {
+                            state.finished_order.push(i);
+                            break;
+                        }
+                    }
+                    return false;
+                }
+                if state.finished_order.len() >= 3 {
+                    state.phase = GamePhase::GameOver;
+                    for i in 0..4 {
+                        if !state.players[i].finished {
+                            state.scores[i] = -15;
+                            state.finished_order.push(i);
+                            break;
+                        }
+                    }
+                    return false;
+                }
+                return state.players[state.current_player].is_bot;
+            }
+        }
+    } else {
+        state.trick.passed.push(cp);
+        state.log.push(format!("{} passes", state.players[cp].name));
+
+        if non_participants(state) >= 3 {
+            if let Some(winner) = state.trick.combo_player {
+                resolve_trick(state, winner);
+                if end_game(state) {
+                    for i in 0..4 {
+                        if !state.players[i].finished {
+                            state.finished_order.push(i);
+                            break;
+                        }
+                    }
+                    return false;
+                }
+                if state.finished_order.len() >= 3 {
+                    state.phase = GamePhase::GameOver;
+                    for i in 0..4 {
+                        if !state.players[i].finished {
+                            state.scores[i] = -15;
+                            state.finished_order.push(i);
+                            break;
+                        }
+                    }
+                    return false;
+                }
+                return state.players[state.current_player].is_bot;
+            }
+            return false;
+        }
+    }
+
+    if state.finished_order.len() >= 3 {
+        state.phase = GamePhase::GameOver;
+        for i in 0..4 {
+            if !state.players[i].finished {
+                state.scores[i] = -15;
+                state.finished_order.push(i);
                 break;
             }
         }
+        return false;
+    }
 
-        if state.finished_order.len() >= 3 {
-            eprintln!("[BOT_TURNS] 3 players finished, game over!");
-            state.phase = GamePhase::GameOver;
-            for i in 0..4 {
-                if !state.players[i].finished {
-                    state.scores[i] = -15;
-                    state.finished_order.push(i);
-                    break;
-                }
-            }
-            break;
-        }
+    state.current_player = (state.current_player + 1) % 4;
+    skip_finished(state);
+    state.players[state.current_player].is_bot && state.phase == GamePhase::Playing
+}
 
-        let next = (state.current_player + 1) % 4;
-        state.current_player = next;
-
-        if !state.players[next].is_bot {
-            eprintln!("[BOT_TURNS] Next player {} is not bot, stopping", next);
-            break;
-        }
+/// Process all consecutive bot turns synchronously (no delay). Used for tests.
+pub fn process_bot_turns(state: &mut GameState) {
+    let mut iteration = 0;
+    while process_one_bot_turn(state) {
+        iteration += 1;
+        if iteration > 100 { break; }
     }
 }
 
@@ -480,7 +467,7 @@ mod tests {
         resolve_trick(&mut state, 0);
         assert_eq!(state.finished_order, vec![0]);
         assert_eq!(state.scores[0], 10);
-        assert_eq!(state.current_player, 0);
+        assert_eq!(state.current_player, 1);
     }
 
     #[test]

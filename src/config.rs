@@ -7,6 +7,7 @@ pub struct Config {
     pub room_ttl_seconds: u64,
     pub max_players: usize,
     pub disconnect_timeout_sec: u64,
+    pub bot_turn_delay_ms: u64,
 }
 
 impl Config {
@@ -33,6 +34,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(15),
+            bot_turn_delay_ms: env::var("BOT_TURN_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2500),
         }
     }
 }
@@ -50,5 +55,6 @@ mod tests {
         assert_eq!(config.room_ttl_seconds, 1800);
         assert_eq!(config.max_players, 4);
         assert_eq!(config.disconnect_timeout_sec, 15);
+        assert_eq!(config.bot_turn_delay_ms, 2500);
     }
 }

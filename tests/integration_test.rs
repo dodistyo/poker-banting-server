@@ -91,7 +91,7 @@ fn test_trick_cycle_basic() {
 
     assert_eq!(state.finished_order, vec![0]);
     assert_eq!(state.scores[0], 10);
-    assert_eq!(state.current_player, 0);
+    assert_eq!(state.current_player, 1);
     assert!(state.trick.cards.is_empty());
     assert!(state.trick.combo_player.is_none());
 }
@@ -215,7 +215,7 @@ fn test_server_msg_created_serialization() {
 
 #[test]
 fn test_room_create_and_join() {
-    let rm = RoomManager::new(6);
+    let rm = RoomManager::new(6, 2500);
 
     let (code, pid, _msg) = rm.create_room("Alice".to_string());
     assert_eq!(pid, 0);
@@ -231,7 +231,7 @@ fn test_room_create_and_join() {
 
 #[test]
 fn test_room_max_players() {
-    let rm = RoomManager::new(6);
+    let rm = RoomManager::new(6, 2500);
 
     let (code, _, _) = rm.create_room("Alice".to_string()); // 1 human + 3 bots
     rm.join_room(&code, "Bob".to_string()).unwrap(); // Replaces bot
@@ -244,7 +244,7 @@ fn test_room_max_players() {
 
 #[test]
 fn test_room_leave_marks_disconnected() {
-    let rm = RoomManager::new(6);
+    let rm = RoomManager::new(6, 2500);
 
     let (code, _, _) = rm.create_room("Alice".to_string());
     rm.join_room(&code, "Bob".to_string()).unwrap(); // Auto-fills to 4
@@ -261,7 +261,7 @@ fn test_room_leave_marks_disconnected() {
 
 #[test]
 fn test_room_invalid_code() {
-    let rm = RoomManager::new(6);
+    let rm = RoomManager::new(6, 2500);
 
     let result = rm.join_room("INVALID", "Alice".to_string());
     assert!(result.is_err());

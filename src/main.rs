@@ -27,7 +27,7 @@ async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
 
     let config = Config::new();
-    let rooms = Arc::new(RoomManager::new(config.room_code_length));
+    let rooms = Arc::new(RoomManager::new(config.room_code_length, config.bot_turn_delay_ms));
 
     println!("Pocer server starting on {}:{}", config.host, config.port);
 

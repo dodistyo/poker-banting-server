@@ -4,22 +4,23 @@ use rand::{thread_rng, Rng};
 use std::sync::Arc;
 use actix_ws::Session;
 use crate::game::state::{Room, GameState, GamePhase};
-use crate::game::rules::{deal_cards, start_three_discard, process_three_discard, process_bot_turns};
-use crate::game::card::Card;
+use crate::game::rules::{deal_cards, start_three_discard, process_three_discard, process_one_bot_turn};
 use crate::protocol::ServerMsg;
 
 pub struct RoomManager {
     rooms: Arc<DashMap<String, Room>>,
     sessions: Arc<DashMap<String, Vec<Session>>>,
     code_length: usize,
+    bot_turn_delay_ms: u64,
 }
 
 impl RoomManager {
-    pub fn new(code_length: usize) -> Self {
+    pub fn new(code_length: usize, bot_turn_delay_ms: u64) -> Self {
         RoomManager {
             rooms: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             code_length,
+            bot_turn_delay_ms,
         }
     }
 
@@ -210,12 +211,16 @@ impl RoomManager {
             .to_uppercase()
     }
 
+    pub fn get_bot_turn_delay_ms(&self) -> u64 {
+        self.bot_turn_delay_ms
+    }
+
     pub fn rooms_ref(&self) -> Arc<DashMap<String, Room>> {
         self.rooms.clone()
     }
 
     pub async fn process_three_discard_delayed(&self, code: &str) {
-        let mut state = match self.get_state(code) {
+        let state = match self.get_state(code) {
             Some(s) => s,
             None => return,
         };
@@ -262,23 +267,33 @@ impl RoomManager {
 
         if state.phase == GamePhase::Playing {
             state.log.push(format!("Game starts! {} leads first trick.", state.players[state.current_player].name));
-            process_bot_turns(&mut state);
+            self.update_state(code, state.clone());
+            self.broadcast(code, ServerMsg::State { state: state.clone() });
+            self.process_bot_turns_delayed(code).await;
+        }
+    }
 
-            if state.finished_order.len() >= 3 {
-                for i in 0..4 {
-                    if !state.players[i].finished {
-                        state.scores[i] = -15;
-                        state.finished_order.push(i);
-                        break;
-                    }
-                }
-                state.phase = GamePhase::GameOver;
-                state.log.push("Game over!".to_string());
-            }
-
+    async fn process_bot_turns_delayed(&self, code: &str) {
+        loop {
+            let mut state = match self.get_state(code) {
+                Some(s) if s.phase == GamePhase::Playing => s,
+                _ => return,
+            };
+            let needs_more = process_one_bot_turn(&mut state);
             self.update_state(code, state.clone());
             self.broadcast(code, ServerMsg::State { state });
+            if !needs_more {
+                break;
+            }
+            actix_web::rt::time::sleep(std::time::Duration::from_millis(self.bot_turn_delay_ms)).await;
         }
+        let mut state = match self.get_state(code) {
+            Some(s) if s.phase == GamePhase::Playing => s,
+            _ => return,
+        };
+        crate::game::rules::skip_finished(&mut state);
+        self.update_state(code, state.clone());
+        self.broadcast(code, ServerMsg::State { state });
     }
 }
 
@@ -288,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_create_room() {
-        let manager = RoomManager::new(6);
+        let manager = RoomManager::new(6, 2500);
         let (code, player_id, msg) = manager.create_room("Alice".to_string());
 
         assert_eq!(code.len(), 6);
@@ -308,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_join_room() {
-        let manager = RoomManager::new(6);
+        let manager = RoomManager::new(6, 2500);
         let (code, _, _) = manager.create_room("Alice".to_string());
 
         let result = manager.join_room(&code, "Bob".to_string());
@@ -327,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_join_room_not_found() {
-        let manager = RoomManager::new(6);
+        let manager = RoomManager::new(6, 2500);
         let result = manager.join_room("XXXXXX", "Bob".to_string());
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Room not found");
@@ -335,7 +350,7 @@ mod tests {
 
     #[test]
     fn test_join_room_full() {
-        let manager = RoomManager::new(6);
+        let manager = RoomManager::new(6, 2500);
         let (code, _, _) = manager.create_room("Alice".to_string()); // 1 human + 3 bots
         manager.join_room(&code, "Bob".to_string()).unwrap(); // Replaces bot, now 2 humans + 2 bots
         manager.join_room(&code, "Charlie".to_string()).unwrap(); // 3 humans + 1 bot
@@ -348,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_leave_room() {
-        let manager = RoomManager::new(6);
+        let manager = RoomManager::new(6, 2500);
         let (code, _, _) = manager.create_room("Alice".to_string());
         manager.join_room(&code, "Bob".to_string()).unwrap(); // Bob replaces Bot 0 at index 1
 
@@ -368,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_get_room() {
-        let manager = RoomManager::new(6);
+        let manager = RoomManager::new(6, 2500);
         let (code, _, _) = manager.create_room("Alice".to_string());
 
         let room = manager.get_room(&code);
@@ -378,18 +393,18 @@ mod tests {
 
     #[test]
     fn test_generate_code_length() {
-        let manager = RoomManager::new(6);
+        let manager = RoomManager::new(6, 2500);
         let (code, _, _) = manager.create_room("Alice".to_string());
         assert_eq!(code.len(), 6);
 
-        let manager2 = RoomManager::new(8);
+        let manager2 = RoomManager::new(8, 2500);
         let (code2, _, _) = manager2.create_room("Bob".to_string());
         assert_eq!(code2.len(), 8);
     }
 
     #[test]
     fn test_multiple_rooms() {
-        let manager = RoomManager::new(6);
+        let manager = RoomManager::new(6, 2500);
         let (code1, _, _) = manager.create_room("Alice".to_string());
         let (code2, _, _) = manager.create_room("Bob".to_string());
 
@@ -399,7 +414,7 @@ mod tests {
 
     #[test]
     fn test_update_state() {
-        let manager = RoomManager::new(6);
+        let manager = RoomManager::new(6, 2500);
         let (code, _, _) = manager.create_room("Alice".to_string());
 
         let mut state = manager.get_state(&code).unwrap();
@@ -412,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_code_is_alphanumeric() {
-        let manager = RoomManager::new(6);
+        let manager = RoomManager::new(6, 2500);
         let (code, _, _) = manager.create_room("Alice".to_string());
         assert!(code.chars().all(|c| c.is_alphanumeric()));
     }
