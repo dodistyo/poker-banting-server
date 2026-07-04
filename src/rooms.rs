@@ -5,6 +5,7 @@ use std::sync::Arc;
 use actix_ws::Session;
 use crate::game::state::{Room, GameState, GamePhase};
 use crate::game::rules::{deal_cards, start_three_discard, process_three_discard, process_bot_turns};
+use crate::game::card::Card;
 use crate::protocol::ServerMsg;
 
 pub struct RoomManager {
@@ -41,18 +42,11 @@ impl RoomManager {
             bot_count += 1;
         }
 
-          // Start game immediately
+        // Start game immediately
         if room.players.len() >= 4 && !room.started {
             room.started = true;
             deal_cards(&mut room.state);
             start_three_discard(&mut room.state);
-            if let Some(ref td) = room.state.three_discard {
-                let order = td.order.clone();
-                for pid in order {
-                    process_three_discard(&mut room.state, pid);
-                }
-            }
-            process_bot_turns(&mut room.state);
         }
 
         self.rooms.insert(code.clone(), room);
@@ -119,13 +113,6 @@ impl RoomManager {
                     room.started = true;
                     deal_cards(&mut room.state);
                     start_three_discard(&mut room.state);
-                    if let Some(ref td) = room.state.three_discard {
-                        let order = td.order.clone();
-                        for pid in order {
-                            process_three_discard(&mut room.state, pid);
-                        }
-                    }
-                    process_bot_turns(&mut room.state);
                 }
 
                 let state = room.state.clone();
@@ -226,6 +213,73 @@ impl RoomManager {
     pub fn rooms_ref(&self) -> Arc<DashMap<String, Room>> {
         self.rooms.clone()
     }
+
+    pub async fn process_three_discard_delayed(&self, code: &str) {
+        let mut state = match self.get_state(code) {
+            Some(s) => s,
+            None => return,
+        };
+        let td = match &state.three_discard {
+            Some(td) => td.clone(),
+            None => return,
+        };
+
+        // Broadcast initial three-discard state
+        self.broadcast(code, ServerMsg::State { state: state.clone() });
+        actix_web::rt::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        for &pid in &td.order {
+            let mut state = match self.get_state(code) {
+                Some(s) if s.three_discard.is_some() => s,
+                _ => return,
+            };
+
+            let player_name = state.players[pid].name.clone();
+            let cards: Vec<String> = state.three_discard.as_ref().unwrap().player_cards[pid]
+                .iter().map(|c| c.to_string()).collect();
+            let count = cards.len();
+
+            process_three_discard(&mut state, pid);
+
+            let log_msg = if count > 0 {
+                format!("{} discarded {} ({} 3s)", player_name, cards.join(" "), count)
+            } else {
+                format!("{} has no 3s", player_name)
+            };
+            state.log.push(log_msg);
+
+            self.update_state(code, state.clone());
+            self.broadcast(code, ServerMsg::State { state });
+
+            actix_web::rt::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        // After all discards, process bot turns
+        let mut state = match self.get_state(code) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if state.phase == GamePhase::Playing {
+            state.log.push(format!("Game starts! {} leads first trick.", state.players[state.current_player].name));
+            process_bot_turns(&mut state);
+
+            if state.finished_order.len() >= 3 {
+                for i in 0..4 {
+                    if !state.players[i].finished {
+                        state.scores[i] = -15;
+                        state.finished_order.push(i);
+                        break;
+                    }
+                }
+                state.phase = GamePhase::GameOver;
+                state.log.push("Game over!".to_string());
+            }
+
+            self.update_state(code, state.clone());
+            self.broadcast(code, ServerMsg::State { state });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -246,7 +300,7 @@ mod tests {
                 assert_eq!(c, code);
                 assert_eq!(pid, 0);
                 assert_eq!(state.players.len(), 4); // Auto-filled with 3 bots
-                assert_eq!(state.phase, GamePhase::Playing); // Game starts immediately
+                assert_eq!(state.phase, GamePhase::ThreeDiscard); // Three-discard phase starts first
             }
             _ => panic!("Expected Created"),
         }

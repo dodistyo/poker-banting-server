@@ -43,23 +43,32 @@ pub async fn ws_index(
                             let (code, pid, server_msg) = rooms.create_room(name);
                             room_code = Some(code.clone());
                             player_id = Some(pid);
-                            rooms.add_session(code, session.clone());
+                            rooms.add_session(code.clone(), session.clone());
                             let _ = session.text(
                                 serde_json::to_string(&server_msg).unwrap(),
                             ).await;
+                            let rooms_clone = rooms.clone();
+                            actix_web::rt::spawn(async move {
+                                rooms_clone.process_three_discard_delayed(&code).await;
+                            });
                         }
                         ClientMsg::Join { code, name } => {
                             eprintln!("[WS] Received Join: {} -> {}", name, code);
                             match rooms.join_room(&code, name) {
                                 Ok(server_msg) => {
-                                    room_code = Some(code.clone());
+                                    let join_code = code.clone();
+                                    room_code = Some(join_code.clone());
                                     if let ServerMsg::Joined { player_id: pid, .. } = &server_msg {
                                         player_id = Some(*pid);
                                     }
-                                    rooms.add_session(code.clone(), session.clone());
+                                    rooms.add_session(join_code.clone(), session.clone());
                                     let _ = session.text(
                                         serde_json::to_string(&server_msg).unwrap(),
                                     ).await;
+                                    let rooms_clone = rooms.clone();
+                                    actix_web::rt::spawn(async move {
+                                        rooms_clone.process_three_discard_delayed(&join_code).await;
+                                    });
                                 }
                                 Err(err) => {
                                     let _ = session.text(
@@ -226,6 +235,9 @@ async fn handle_play(
 
     if !result.valid {
         eprintln!("[PLAY] Invalid play by player {}: {}", player_id, result.error);
+        state.log.push(format!("{}'s play is invalid: {}", state.players[player_id].name, result.error));
+        rooms.update_state(code, state.clone());
+        broadcast_state(rooms, code);
         return;
     }
 
@@ -252,9 +264,12 @@ async fn handle_play(
         }
         state.trick.passed.clear();
     }
+    let card_labels: Vec<String> = cards.iter().map(|c| c.to_string()).collect();
     state.trick.cards = cards;
     state.trick.combo_type = Some(result.combo.as_ref().unwrap().combo_type.clone());
     state.trick.combo_player = Some(player_id);
+
+    state.log.push(format!("{} plays {} ({})", state.players[player_id].name, card_labels.join(" "), result.combo_name));
 
     if let Some(winner) = check_trick_complete(&state) {
         resolve_trick(&mut state, winner);
@@ -335,6 +350,7 @@ async fn handle_pass(
     eprintln!("[PASS] Player {} passes. Current combo: {:?}, passed: {:?}", player_id, state.trick.combo_player, state.trick.passed);
 
     state.trick.passed.push(player_id);
+    state.log.push(format!("{} passes", state.players[player_id].name));
 
     if non_participants(&state) >= 3 {
         if let Some(winner) = state.trick.combo_player {

@@ -271,6 +271,8 @@ pub fn process_bot_turns(state: &mut GameState) {
 
             if result.valid {
                 eprintln!("[BOT_TURNS] Bot {} plays {} cards: {:?}", cp, indices.len(), cards.iter().map(|c| c.label()).collect::<Vec<_>>());
+                let card_labels: Vec<String> = cards.iter().map(|c| c.to_string()).collect();
+                state.log.push(format!("{} plays {} ({})", state.players[cp].name, card_labels.join(" "), result.combo_name));
                 let hand = &mut state.players[cp].hand;
                 for &i in indices.iter().rev() {
                     hand.remove(i);
@@ -281,6 +283,7 @@ pub fn process_bot_turns(state: &mut GameState) {
                     state.finished_order.push(cp);
                     let pos = state.finished_order.len();
                     state.scores[cp] = if pos == 1 { 10 } else if pos == 2 { 5 } else if pos == 3 { 0 } else { -15 };
+                    state.log.push(format!("{} finished ({}th, {} pts)", state.players[cp].name, ["", "1st", "2nd", "3rd"][pos], state.scores[cp]));
                     eprintln!("[BOT_TURNS] Bot {} finished (empty hand), position: {}", cp, pos);
                 }
 
@@ -327,6 +330,7 @@ pub fn process_bot_turns(state: &mut GameState) {
         } else {
             eprintln!("[BOT_TURNS] Bot {} passes", cp);
             state.trick.passed.push(cp);
+            state.log.push(format!("{} passes", state.players[cp].name));
 
             if non_participants(state) >= 3 {
                 if let Some(winner) = state.trick.combo_player {
@@ -442,11 +446,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_play_suit_tiebreak() {
+    fn test_validate_play_same_rank_single_cannot_beat() {
         let table = combo::detect_combo(&[card(Rank::Three, Suit::Diamonds)]).unwrap();
         let cards = vec![card(Rank::Three, Suit::Spades)];
         let result = validate_play(&cards, Some(&table));
-        assert!(result.valid);
+        assert!(!result.valid);
     }
 
     #[test]

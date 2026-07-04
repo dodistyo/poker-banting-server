@@ -154,12 +154,7 @@ pub fn compare_combos(combo_a: &Combo, combo_b: &Combo) -> Option<i32> {
         ComboType::Single => {
             let a = &combo_a.cards[0];
             let b = &combo_b.cards[0];
-            let rank_diff = a.rank_index() as i32 - b.rank_index() as i32;
-            if rank_diff != 0 {
-                Some(rank_diff)
-            } else {
-                Some(a.suit_index() as i32 - b.suit_index() as i32)
-            }
+            Some(a.rank_index() as i32 - b.rank_index() as i32)
         }
         ComboType::Pair | ComboType::Triple => {
             let a_high = combo_a.cards.last().unwrap().rank_index() as i32;
@@ -454,10 +449,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_single_suit_tiebreak() {
+    fn test_compare_single_same_rank_equal() {
         let a = detect_combo(&[card(Rank::Three, Suit::Spades)]).unwrap();
         let b = detect_combo(&[card(Rank::Three, Suit::Diamonds)]).unwrap();
-        assert!(compare_combos(&a, &b).unwrap() > 0);
+        assert_eq!(compare_combos(&a, &b).unwrap(), 0);
     }
 
     #[test]

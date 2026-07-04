@@ -307,5 +307,5 @@ fn test_validate_play_matches_js() {
 
     let table = combo::detect_combo(&[card(Rank::Three, Suit::Diamonds)]).unwrap();
     let result = validate_play(&[card(Rank::Three, Suit::Spades)], Some(&table));
-    assert!(result.valid);
+    assert!(!result.valid);
 }
