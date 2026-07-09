@@ -23,6 +23,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
     let (ws_tx, ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
     let mut room_code: Option<String> = None;
     let mut player_id: Option<usize> = None;
+    let mut session_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Message>>> = None;
 
     tokio::spawn(write_forward(write, ws_rx));
 
@@ -35,16 +36,16 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
             }
             Ok(Message::Close(_)) => {
                 eprintln!("[WS] Close received");
-                if let Some(ref code) = room_code {
-                    rooms.remove_session(code);
+                if let (Some(code), Some(tx)) = (&room_code, &session_tx) {
+                    rooms.remove_session(code, tx);
                 }
                 break;
             }
             Ok(_) => continue,
             Err(e) => {
                 eprintln!("[WS] Error reading message: {}", e);
-                if let Some(ref code) = room_code {
-                    rooms.remove_session(code);
+                if let (Some(code), Some(tx)) = (&room_code, &session_tx) {
+                    rooms.remove_session(code, tx);
                 }
                 break;
             }
@@ -74,7 +75,9 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 ));
 
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-                rooms.add_session(code.clone(), tx);
+                let session = Arc::new(tx);
+                session_tx = Some(session.clone());
+                rooms.add_session(code.clone(), session);
 
                 let fwd_tx = ws_tx.clone();
                 tokio::spawn(async move {
@@ -105,7 +108,9 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                         ));
 
                         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-                        rooms.add_session(join_code.clone(), tx);
+                        let session = Arc::new(tx);
+                        session_tx = Some(session.clone());
+                        rooms.add_session(join_code.clone(), session);
 
                         let fwd_tx = ws_tx.clone();
                         tokio::spawn(async move {
@@ -164,8 +169,8 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
     }
 
     eprintln!("[WS] Connection closed");
-    if let Some(ref code) = room_code {
-        rooms.remove_session(code);
+    if let (Some(code), Some(tx)) = (&room_code, &session_tx) {
+        rooms.remove_session(code, tx);
     }
 }
 

@@ -8,9 +8,11 @@ use crate::game::state::{Room, GameState, GamePhase};
 use crate::game::rules::{deal_cards, start_three_discard, process_three_discard, process_one_bot_turn};
 use crate::protocol::ServerMsg;
 
+type SessionSender = Arc<UnboundedSender<Message>>;
+
 pub struct RoomManager {
     rooms: Arc<DashMap<String, Room>>,
-    sessions: Arc<DashMap<String, Vec<UnboundedSender<Message>>>>,
+    sessions: Arc<DashMap<String, Vec<SessionSender>>>,
     code_length: usize,
     bot_turn_delay_ms: u64,
 }
@@ -25,12 +27,17 @@ impl RoomManager {
         }
     }
 
-    pub fn add_session(&self, code: String, sender: UnboundedSender<Message>) {
+    pub fn add_session(&self, code: String, sender: SessionSender) {
         self.sessions.entry(code).or_insert_with(Vec::new).push(sender);
     }
 
-    pub fn remove_session(&self, code: &str) {
-        self.sessions.remove(code);
+    pub fn remove_session(&self, code: &str, sender: &Arc<UnboundedSender<Message>>) {
+        if let Some(mut entry) = self.sessions.get_mut(code) {
+            entry.retain(|s| !Arc::ptr_eq(s, sender));
+            if entry.is_empty() {
+                self.sessions.remove(code);
+            }
+        }
     }
 
     pub fn create_room(&self, host_name: String) -> (String, usize, ServerMsg) {
@@ -183,7 +190,7 @@ impl RoomManager {
 
         if let Some(entry) = self.sessions.get(code) {
             let message = Message::Text(json.into());
-            let senders: Vec<_> = entry.value().clone();
+            let senders: Vec<_> = entry.iter().map(|e| e.clone()).collect();
             for sender in senders {
                 let _ = sender.send(message.clone());
             }
