@@ -2,14 +2,15 @@ use dashmap::DashMap;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use std::sync::Arc;
-use actix_ws::Session;
+use axum::extract::ws::Message;
+use tokio::sync::mpsc::UnboundedSender;
 use crate::game::state::{Room, GameState, GamePhase};
 use crate::game::rules::{deal_cards, start_three_discard, process_three_discard, process_one_bot_turn};
 use crate::protocol::ServerMsg;
 
 pub struct RoomManager {
     rooms: Arc<DashMap<String, Room>>,
-    sessions: Arc<DashMap<String, Vec<Session>>>,
+    sessions: Arc<DashMap<String, Vec<UnboundedSender<Message>>>>,
     code_length: usize,
     bot_turn_delay_ms: u64,
 }
@@ -24,8 +25,8 @@ impl RoomManager {
         }
     }
 
-    pub fn add_session(&self, code: String, session: Session) {
-        self.sessions.entry(code).or_insert_with(Vec::new).push(session);
+    pub fn add_session(&self, code: String, sender: UnboundedSender<Message>) {
+        self.sessions.entry(code).or_insert_with(Vec::new).push(sender);
     }
 
     pub fn remove_session(&self, code: &str) {
@@ -36,14 +37,12 @@ impl RoomManager {
         let code = self.generate_code();
         let mut room = Room::new(code.clone(), host_name.clone());
 
-        // Fill bots to 4 players
         let mut bot_count = 0;
         while room.players.len() < 4 {
             room.add_bot(format!("Bot {}", bot_count));
             bot_count += 1;
         }
 
-        // Start game immediately
         if room.players.len() >= 4 && !room.started {
             room.started = true;
             deal_cards(&mut room.state);
@@ -69,14 +68,13 @@ impl RoomManager {
         let code = code.to_uppercase();
         let mut room = self.rooms.get_mut(&code).ok_or("Room not found")?;
 
-        // If room is full but has bots, replace a bot with the human
         if room.players.len() >= 4 {
             if let Some(bot_idx) = room.players.iter().position(|p| p.is_bot) {
                 room.players[bot_idx].name = name.clone();
                 room.players[bot_idx].is_bot = false;
                 room.players[bot_idx].connected = true;
                 room.players[bot_idx].disconnect_time = None;
-                // Also update game state
+
                 if bot_idx < room.state.players.len() {
                     room.state.players[bot_idx].name = name.clone();
                     room.state.players[bot_idx].is_bot = false;
@@ -102,14 +100,12 @@ impl RoomManager {
 
         match room.add_player(name) {
             Ok(player_id) => {
-                // Fill bots if room not full
                 let mut bot_count = 0;
                 while room.players.len() < 4 {
                     room.add_bot(format!("Bot {}", bot_count));
                     bot_count += 1;
                 }
 
-                // Start game if room is full and not started
                 if room.players.len() >= 4 && !room.started {
                     room.started = true;
                     deal_cards(&mut room.state);
@@ -146,7 +142,6 @@ impl RoomManager {
             .find(|p| p.id == player_id)
             .map(|p| p.name.clone())?;
 
-        // Mark as disconnected
         if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
             player.connected = false;
             player.disconnect_time = Some(std::time::SystemTime::now()
@@ -187,14 +182,10 @@ impl RoomManager {
         };
 
         if let Some(entry) = self.sessions.get(code) {
-            for session in entry.value() {
-                actix_web::rt::spawn({
-                    let mut session = session.clone();
-                    let json = json.clone();
-                    async move {
-                        let _ = session.text(json).await;
-                    }
-                });
+            let message = Message::Text(json.into());
+            let senders: Vec<_> = entry.value().clone();
+            for sender in senders {
+                let _ = sender.send(message.clone());
             }
         }
     }
@@ -229,9 +220,8 @@ impl RoomManager {
             None => return,
         };
 
-        // Broadcast initial three-discard state
         self.broadcast(code, ServerMsg::State { state: state.clone() });
-        actix_web::rt::time::sleep(std::time::Duration::from_millis(600)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
         for &pid in &td.order {
             let mut state = match self.get_state(code) {
@@ -256,10 +246,9 @@ impl RoomManager {
             self.update_state(code, state.clone());
             self.broadcast(code, ServerMsg::State { state });
 
-            actix_web::rt::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        // After all discards, process bot turns
         let mut state = match self.get_state(code) {
             Some(s) => s,
             None => return,
@@ -285,7 +274,7 @@ impl RoomManager {
             if !needs_more {
                 break;
             }
-            actix_web::rt::time::sleep(std::time::Duration::from_millis(self.bot_turn_delay_ms)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(self.bot_turn_delay_ms)).await;
         }
         let mut state = match self.get_state(code) {
             Some(s) if s.phase == GamePhase::Playing => s,
@@ -314,8 +303,8 @@ mod tests {
             ServerMsg::Created { code: c, player_id: pid, state } => {
                 assert_eq!(c, code);
                 assert_eq!(pid, 0);
-                assert_eq!(state.players.len(), 4); // Auto-filled with 3 bots
-                assert_eq!(state.phase, GamePhase::ThreeDiscard); // Three-discard phase starts first
+                assert_eq!(state.players.len(), 4);
+                assert_eq!(state.phase, GamePhase::ThreeDiscard);
             }
             _ => panic!("Expected Created"),
         }
@@ -331,7 +320,7 @@ mod tests {
 
         match result.unwrap() {
             ServerMsg::Joined { player_id, state } => {
-                assert_eq!(player_id, 1); // Replaced Bot 0
+                assert_eq!(player_id, 1);
                 assert_eq!(state.players[player_id].name, "Bob");
                 assert_eq!(state.players[player_id].is_bot, false);
                 assert_eq!(state.players.len(), 4);
@@ -351,10 +340,10 @@ mod tests {
     #[test]
     fn test_join_room_full() {
         let manager = RoomManager::new(6, 2500);
-        let (code, _, _) = manager.create_room("Alice".to_string()); // 1 human + 3 bots
-        manager.join_room(&code, "Bob".to_string()).unwrap(); // Replaces bot, now 2 humans + 2 bots
-        manager.join_room(&code, "Charlie".to_string()).unwrap(); // 3 humans + 1 bot
-        manager.join_room(&code, "Dave".to_string()).unwrap(); // 4 humans, no bots
+        let (code, _, _) = manager.create_room("Alice".to_string());
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.join_room(&code, "Charlie".to_string()).unwrap();
+        manager.join_room(&code, "Dave".to_string()).unwrap();
 
         let result = manager.join_room(&code, "Eve".to_string());
         assert!(result.is_err());
@@ -365,7 +354,7 @@ mod tests {
     fn test_leave_room() {
         let manager = RoomManager::new(6, 2500);
         let (code, _, _) = manager.create_room("Alice".to_string());
-        manager.join_room(&code, "Bob".to_string()).unwrap(); // Bob replaces Bot 0 at index 1
+        manager.join_room(&code, "Bob".to_string()).unwrap();
 
         let result = manager.leave_room(&code, 1);
         assert!(result.is_some());

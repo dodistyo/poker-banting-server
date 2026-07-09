@@ -1,7 +1,8 @@
-use actix_web::{web, Error, HttpRequest, HttpResponse};
-use actix_web::web::Data;
-use actix_ws::{handle, Message};
-use futures_util::StreamExt;
+use axum::{
+    extract::{State, WebSocketUpgrade, ws::{Message, WebSocket}},
+    response::Response,
+};
+use futures_util::{StreamExt, SinkExt};
 use std::sync::Arc;
 use crate::protocol::{ClientMsg, ServerMsg};
 use crate::rooms::RoomManager;
@@ -10,134 +11,170 @@ use crate::game::state::GamePhase;
 use crate::game::combo;
 
 pub async fn ws_index(
-    req: HttpRequest,
-    payload: web::Payload,
-    rooms_data: Data<Arc<RoomManager>>,
-) -> Result<HttpResponse, Error> {
-    let rooms = rooms_data.get_ref().clone();
+    State(rooms): State<Arc<RoomManager>>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket: WebSocket| handle_ws(socket, rooms))
+}
 
-    let (response, mut session, mut msg_stream) = handle(&req, payload)?;
+async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
+    let (write, mut read) = socket.split();
 
+    let (ws_tx, ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
     let mut room_code: Option<String> = None;
     let mut player_id: Option<usize> = None;
 
-    actix_web::rt::spawn(async move {
-        while let Some(Ok(msg)) = msg_stream.next().await {
-            match msg {
-                Message::Text(text) => {
-                    let client_msg: ClientMsg = match serde_json::from_str(&text) {
-                        Ok(m) => m,
-                        Err(_) => {
-                            let _ = session.text(
-                                serde_json::to_string(&ServerMsg::Error {
-                                    message: "Invalid message format".to_string(),
-                                }).unwrap(),
-                            ).await;
-                            continue;
-                        }
-                    };
+    tokio::spawn(write_forward(write, ws_rx));
 
-                    match client_msg {
-                        ClientMsg::Create { name } => {
-                            eprintln!("[WS] Received Create: {}", name);
-                            let (code, pid, server_msg) = rooms.create_room(name);
-                            room_code = Some(code.clone());
-                            player_id = Some(pid);
-                            rooms.add_session(code.clone(), session.clone());
-                            let _ = session.text(
-                                serde_json::to_string(&server_msg).unwrap(),
-                            ).await;
-                            let rooms_clone = rooms.clone();
-                            actix_web::rt::spawn(async move {
-                                rooms_clone.process_three_discard_delayed(&code).await;
-                            });
-                        }
-                        ClientMsg::Join { code, name } => {
-                            eprintln!("[WS] Received Join: {} -> {}", name, code);
-                            match rooms.join_room(&code, name) {
-                                Ok(server_msg) => {
-                                    let join_code = code.clone();
-                                    room_code = Some(join_code.clone());
-                                    if let ServerMsg::Joined { player_id: pid, .. } = &server_msg {
-                                        player_id = Some(*pid);
-                                    }
-                                    rooms.add_session(join_code.clone(), session.clone());
-                                    let _ = session.text(
-                                        serde_json::to_string(&server_msg).unwrap(),
-                                    ).await;
-                                    let rooms_clone = rooms.clone();
-                                    actix_web::rt::spawn(async move {
-                                        rooms_clone.process_three_discard_delayed(&join_code).await;
-                                    });
-                                }
-                                Err(err) => {
-                                    let _ = session.text(
-                                        serde_json::to_string(&ServerMsg::Error {
-                                            message: err,
-                                        }).unwrap(),
-                                    ).await;
-                                }
-                            }
-                        }
-                        ClientMsg::Play { cards } => {
-                            if room_code.is_none() || player_id.is_none() {
-                                eprintln!("[WS] Play received but not in a room");
-                                continue;
-                            }
-                            let code = room_code.clone().unwrap();
-                            let pid = player_id.unwrap();
-                            let rooms_clone = rooms.clone();
-                            actix_web::rt::spawn(async move {
-                                handle_play(&rooms_clone, &code, pid, cards).await;
-                            });
-                        }
-                        ClientMsg::Pass => {
-                            if room_code.is_none() || player_id.is_none() {
-                                eprintln!("[WS] Pass received but not in a room");
-                                continue;
-                            }
-                            let code = room_code.clone().unwrap();
-                            let pid = player_id.unwrap();
-                            let rooms_clone = rooms.clone();
-                            actix_web::rt::spawn(async move {
-                                handle_pass(&rooms_clone, &code, pid).await;
-                            });
-                        }
-                        ClientMsg::Ping => {
-                            let _ = session.text(
-                                serde_json::to_string(&ServerMsg::Pong).unwrap(),
-                            ).await;
+    while let Some(msg) = read.next().await {
+        let text = match msg {
+            Ok(Message::Text(t)) => t,
+            Ok(Message::Binary(_)) => {
+                eprintln!("[WS] Binary messages not supported");
+                continue;
+            }
+            Ok(Message::Close(_)) => {
+                eprintln!("[WS] Close received");
+                if let Some(ref code) = room_code {
+                    rooms.remove_session(code);
+                }
+                break;
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("[WS] Error reading message: {}", e);
+                if let Some(ref code) = room_code {
+                    rooms.remove_session(code);
+                }
+                break;
+            }
+        };
+
+        let client_msg: ClientMsg = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(_) => {
+                let _ = ws_tx.send(Message::Text(
+                    serde_json::to_string(&ServerMsg::Error {
+                        message: "Invalid message format".to_string(),
+                    }).unwrap().into(),
+                ));
+                continue;
+            }
+        };
+
+        match client_msg {
+            ClientMsg::Create { name } => {
+                eprintln!("[WS] Received Create: {}", name);
+                let (code, pid, server_msg) = rooms.create_room(name);
+                room_code = Some(code.clone());
+                player_id = Some(pid);
+
+                let _ = ws_tx.send(Message::Text(
+                    serde_json::to_string(&server_msg).unwrap().into(),
+                ));
+
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                rooms.add_session(code.clone(), tx);
+
+                let fwd_tx = ws_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(broadcast_msg) = rx.recv().await {
+                        if fwd_tx.send(broadcast_msg).is_err() {
+                            break;
                         }
                     }
-                }
-                Message::Binary(_) => {
-                    eprintln!("[WS] Binary messages not supported");
-                }
-                Message::Close(close) => {
-                    eprintln!("[WS] Close: {:?}", close);
-                    if let Some(ref code) = room_code {
-                        // TODO: bot takeover on disconnect (blocked)
-                        // if let Some(pid) = player_id {
-                        //     rooms.on_disconnect(code, pid);
-                        // }
-                        rooms.remove_session(code);
+                });
+
+                let rooms_clone = rooms.clone();
+                let code_clone = code.clone();
+                tokio::spawn(async move {
+                    rooms_clone.process_three_discard_delayed(&code_clone).await;
+                });
+            }
+            ClientMsg::Join { code, name } => {
+                eprintln!("[WS] Received Join: {} -> {}", name, code);
+                match rooms.join_room(&code, name) {
+                    Ok(server_msg) => {
+                        let join_code = code.clone();
+                        room_code = Some(join_code.clone());
+                        if let ServerMsg::Joined { player_id: pid, .. } = &server_msg {
+                            player_id = Some(*pid);
+                        }
+                        let _ = ws_tx.send(Message::Text(
+                            serde_json::to_string(&server_msg).unwrap().into(),
+                        ));
+
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                        rooms.add_session(join_code.clone(), tx);
+
+                        let fwd_tx = ws_tx.clone();
+                        tokio::spawn(async move {
+                            while let Some(broadcast_msg) = rx.recv().await {
+                                if fwd_tx.send(broadcast_msg).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        let rooms_clone = rooms.clone();
+                        let join_code_clone = join_code.clone();
+                        tokio::spawn(async move {
+                            rooms_clone.process_three_discard_delayed(&join_code_clone).await;
+                        });
                     }
-                    break;
+                    Err(err) => {
+                        let _ = ws_tx.send(Message::Text(
+                            serde_json::to_string(&ServerMsg::Error {
+                                message: err,
+                            }).unwrap().into(),
+                        ));
+                    }
                 }
-                _ => {}
+            }
+            ClientMsg::Play { cards } => {
+                if room_code.is_none() || player_id.is_none() {
+                    eprintln!("[WS] Play received but not in a room");
+                    continue;
+                }
+                let code = room_code.clone().unwrap();
+                let pid = player_id.unwrap();
+                let rooms_clone = rooms.clone();
+                tokio::spawn(async move {
+                    handle_play(&rooms_clone, &code, pid, cards).await;
+                });
+            }
+            ClientMsg::Pass => {
+                if room_code.is_none() || player_id.is_none() {
+                    eprintln!("[WS] Pass received but not in a room");
+                    continue;
+                }
+                let code = room_code.clone().unwrap();
+                let pid = player_id.unwrap();
+                let rooms_clone = rooms.clone();
+                tokio::spawn(async move {
+                    handle_pass(&rooms_clone, &code, pid).await;
+                });
+            }
+            ClientMsg::Ping => {
+                let _ = ws_tx.send(Message::Text(
+                    serde_json::to_string(&ServerMsg::Pong).unwrap().into(),
+                ));
             }
         }
-        eprintln!("[WS] Connection closed");
-        if let Some(ref code) = room_code {
-            // TODO: bot takeover on disconnect (blocked)
-            // if let Some(pid) = player_id {
-            //     rooms.on_disconnect(code, pid);
-            // }
-            rooms.remove_session(code);
-        }
-    });
+    }
 
-    Ok(response)
+    eprintln!("[WS] Connection closed");
+    if let Some(ref code) = room_code {
+        rooms.remove_session(code);
+    }
+}
+
+async fn write_forward(mut write: impl futures_util::Sink<Message> + Unpin, mut rx: tokio::sync::mpsc::UnboundedReceiver<Message>) {
+    while let Some(msg) = rx.recv().await {
+        if write.send(msg).await.is_err() {
+            break;
+        }
+    }
 }
 
 async fn handle_play(
@@ -146,7 +183,7 @@ async fn handle_play(
     player_id: usize,
     card_ids: Vec<String>,
 ) {
-    actix_web::rt::task::yield_now().await;
+    tokio::task::yield_now().await;
     let mut state = match rooms.get_state(code) {
         Some(s) => s,
         None => return,
@@ -174,7 +211,6 @@ async fn handle_play(
 
     let player = &state.players[player_id];
 
-    // Look up cards by rank:suit identifier
     let mut cards = Vec::new();
     let mut indices_to_remove = Vec::new();
     for card_id in &card_ids {
@@ -185,7 +221,6 @@ async fn handle_play(
         }
         let (rank_str, suit_str) = (parts[0], parts[1]);
 
-        // Parse rank string to enum
         let rank = match rank_str {
             "3" => crate::game::card::Rank::Three,
             "4" => crate::game::card::Rank::Four,
@@ -203,7 +238,6 @@ async fn handle_play(
             _ => { eprintln!("[PLAY] Unknown rank: {}", rank_str); return; }
         };
 
-        // Parse suit string to enum
         let suit = match suit_str {
             "diamonds" => crate::game::card::Suit::Diamonds,
             "clubs" => crate::game::card::Suit::Clubs,
@@ -241,7 +275,6 @@ async fn handle_play(
         return;
     }
 
-    // Remove cards from hand (reverse sorted indices to avoid shift issues)
     let hand = &mut state.players[player_id].hand;
     let mut sorted_indices = indices_to_remove;
     sorted_indices.sort_unstable();
@@ -249,7 +282,6 @@ async fn handle_play(
         hand.remove(i);
     }
 
-    // Mark player as finished immediately when hand is empty
     if state.players[player_id].hand.is_empty() && !state.players[player_id].finished {
         state.players[player_id].finished = true;
         state.finished_order.push(player_id);
@@ -304,7 +336,7 @@ async fn handle_pass(
     code: &str,
     player_id: usize,
 ) {
-    actix_web::rt::task::yield_now().await;
+    tokio::task::yield_now().await;
     let mut state = match rooms.get_state(code) {
         Some(s) => s,
         None => return,
@@ -388,7 +420,7 @@ async fn process_bot_turns_delayed(rooms: &Arc<RoomManager>, code: &str) {
             break;
         }
         let delay_ms = rooms.get_bot_turn_delay_ms();
-        actix_web::rt::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
     let mut state = match rooms.get_state(code) {
         Some(s) if s.phase == GamePhase::Playing => s,

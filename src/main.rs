@@ -4,7 +4,8 @@ pub mod protocol;
 pub mod rooms;
 pub mod ws;
 
-use actix_web::{web, App, HttpServer, Responder};
+use axum::{routing::get, Router, response::Json, extract::State};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use config::Config;
 use rooms::RoomManager;
@@ -15,29 +16,31 @@ struct HealthResponse {
     rooms: usize,
 }
 
-async fn health(rooms: web::Data<Arc<RoomManager>>) -> impl Responder {
-    actix_web::HttpResponse::Ok().json(HealthResponse {
+async fn health(State(rooms): State<Arc<RoomManager>>) -> Json<HealthResponse> {
+    Json(HealthResponse {
         status: "ok".to_string(),
         rooms: rooms.room_count(),
     })
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
 
     let config = Config::new();
     let rooms = Arc::new(RoomManager::new(config.room_code_length, config.bot_turn_delay_ms));
 
-    println!("Pocer server starting on {}:{}", config.host, config.port);
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/ws", get(ws::ws_index))
+        .with_state(rooms);
 
-    HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(rooms.clone()))
-            .route("/health", web::get().to(health))
-            .route("/ws", web::get().to(ws::ws_index))
-    })
-    .bind((config.host, config.port))?
-    .run()
-    .await
+    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
+        .parse()
+        .expect("Invalid address");
+
+    println!("Pocer server starting on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await
 }
