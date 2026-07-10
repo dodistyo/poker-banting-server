@@ -18,6 +18,7 @@ pub async fn ws_index(
 }
 
 async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
+    eprintln!("[WS] New connection established");
     let (write, mut read) = socket.split();
 
     let (ws_tx, ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
@@ -26,10 +27,14 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
     let mut session_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Message>>> = None;
 
     tokio::spawn(write_forward(write, ws_rx));
+    eprintln!("[WS] write_forward spawned, starting read loop");
 
     while let Some(msg) = read.next().await {
         let text = match msg {
-            Ok(Message::Text(t)) => t,
+            Ok(Message::Text(t)) => {
+                eprintln!("[WS] Received text: {}", t);
+                t
+            }
             Ok(Message::Binary(_)) => {
                 eprintln!("[WS] Binary messages not supported");
                 continue;
@@ -53,7 +58,8 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
 
         let client_msg: ClientMsg = match serde_json::from_str(&text) {
             Ok(m) => m,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("[WS] Failed to parse message: {}", e);
                 let _ = ws_tx.send(Message::Text(
                     serde_json::to_string(&ServerMsg::Error {
                         message: "Invalid message format".to_string(),
@@ -66,7 +72,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
         match client_msg {
             ClientMsg::Create { name } => {
                 eprintln!("[WS] Received Create: {}", name);
-                let (code, pid, server_msg) = rooms.create_room(name);
+                let (code, pid, server_msg, should_spawn) = rooms.create_room(name);
                 room_code = Some(code.clone());
                 player_id = Some(pid);
 
@@ -88,16 +94,18 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                     }
                 });
 
-                let rooms_clone = rooms.clone();
-                let code_clone = code.clone();
-                tokio::spawn(async move {
-                    rooms_clone.process_three_discard_delayed(&code_clone).await;
-                });
+                if should_spawn {
+                    let rooms_clone = rooms.clone();
+                    let code_clone = code.clone();
+                    tokio::spawn(async move {
+                        rooms_clone.process_three_discard_delayed(&code_clone).await;
+                    });
+                }
             }
             ClientMsg::Join { code, name } => {
                 eprintln!("[WS] Received Join: {} -> {}", name, code);
                 match rooms.join_room(&code, name) {
-                    Ok(server_msg) => {
+                    Ok((server_msg, should_spawn)) => {
                         let join_code = code.clone();
                         room_code = Some(join_code.clone());
                         if let ServerMsg::Joined { player_id: pid, .. } = &server_msg {
@@ -121,11 +129,13 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                             }
                         });
 
-                        let rooms_clone = rooms.clone();
-                        let join_code_clone = join_code.clone();
-                        tokio::spawn(async move {
-                            rooms_clone.process_three_discard_delayed(&join_code_clone).await;
-                        });
+                        if should_spawn {
+                            let rooms_clone = rooms.clone();
+                            let join_code_clone = join_code.clone();
+                            tokio::spawn(async move {
+                                rooms_clone.process_three_discard_delayed(&join_code_clone).await;
+                            });
+                        }
                     }
                     Err(err) => {
                         let _ = ws_tx.send(Message::Text(
@@ -175,11 +185,15 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
 }
 
 async fn write_forward(mut write: impl futures_util::Sink<Message> + Unpin, mut rx: tokio::sync::mpsc::UnboundedReceiver<Message>) {
+    eprintln!("[WS] write_forward: starting");
     while let Some(msg) = rx.recv().await {
+        eprintln!("[WS] write_forward: sending message");
         if write.send(msg).await.is_err() {
+            eprintln!("[WS] write_forward: send failed, exiting");
             break;
         }
     }
+    eprintln!("[WS] write_forward: exited cleanly");
 }
 
 async fn handle_play(

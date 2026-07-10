@@ -217,13 +217,13 @@ fn test_server_msg_created_serialization() {
 fn test_room_create_and_join() {
     let rm = RoomManager::new(6, 2500);
 
-    let (code, pid, _msg) = rm.create_room("Alice".to_string());
+    let (code, pid, _msg, _) = rm.create_room("Alice".to_string());
     assert_eq!(pid, 0);
     assert_eq!(code.len(), 6);
 
     let result = rm.join_room(&code, "Bob".to_string());
     assert!(result.is_ok());
-    let ServerMsg::Joined { player_id: bob_pid, .. } = result.unwrap() else {
+    let (ServerMsg::Joined { player_id: bob_pid, .. }, _) = result.unwrap() else {
         panic!("Expected Joined message");
     };
     assert_eq!(bob_pid, 1);
@@ -233,7 +233,7 @@ fn test_room_create_and_join() {
 fn test_room_max_players() {
     let rm = RoomManager::new(6, 2500);
 
-    let (code, _, _) = rm.create_room("Alice".to_string()); // 1 human + 3 bots
+    let (code, _, _, _) = rm.create_room("Alice".to_string()); // 1 human + 3 bots
     rm.join_room(&code, "Bob".to_string()).unwrap(); // Replaces bot
     rm.join_room(&code, "Charlie".to_string()).unwrap(); // Replaces bot
     rm.join_room(&code, "Dave".to_string()).unwrap(); // Replaces last bot
@@ -246,7 +246,7 @@ fn test_room_max_players() {
 fn test_room_leave_marks_disconnected() {
     let rm = RoomManager::new(6, 2500);
 
-    let (code, _, _) = rm.create_room("Alice".to_string());
+    let (code, _, _, _) = rm.create_room("Alice".to_string());
     rm.join_room(&code, "Bob".to_string()).unwrap(); // Auto-fills to 4
 
     let room = rm.get_room(&code).unwrap();

@@ -40,7 +40,7 @@ impl RoomManager {
         }
     }
 
-    pub fn create_room(&self, host_name: String) -> (String, usize, ServerMsg) {
+    pub fn create_room(&self, host_name: String) -> (String, usize, ServerMsg, bool) {
         let code = self.generate_code();
         let mut room = Room::new(code.clone(), host_name.clone());
 
@@ -50,8 +50,10 @@ impl RoomManager {
             bot_count += 1;
         }
 
-        if room.players.len() >= 4 && !room.started {
+        let should_spawn = room.players.len() >= 4 && !room.started;
+        if should_spawn {
             room.started = true;
+            room.delay_task_spawned = true;
             deal_cards(&mut room.state);
             start_three_discard(&mut room.state);
         }
@@ -68,10 +70,11 @@ impl RoomManager {
                 player_id: 0,
                 state,
             },
+            should_spawn,
         )
     }
 
-    pub fn join_room(&self, code: &str, name: String) -> Result<ServerMsg, String> {
+    pub fn join_room(&self, code: &str, name: String) -> Result<(ServerMsg, bool), String> {
         let code = code.to_uppercase();
         let mut room = self.rooms.get_mut(&code).ok_or("Room not found")?;
 
@@ -97,10 +100,10 @@ impl RoomManager {
                     name: name.clone(),
                 });
 
-                return Ok(ServerMsg::Joined {
+                return Ok((ServerMsg::Joined {
                     player_id,
                     state,
-                });
+                }, false));
             }
             return Err("Room is full".to_string());
         }
@@ -113,8 +116,10 @@ impl RoomManager {
                     bot_count += 1;
                 }
 
+                let should_spawn = room.players.len() >= 4 && !room.started && !room.delay_task_spawned;
                 if room.players.len() >= 4 && !room.started {
                     room.started = true;
+                    room.delay_task_spawned = true;
                     deal_cards(&mut room.state);
                     start_three_discard(&mut room.state);
                 }
@@ -133,10 +138,10 @@ impl RoomManager {
                     self.broadcast(&code, ServerMsg::State { state: state.clone() });
                 }
 
-                Ok(ServerMsg::Joined {
+                Ok((ServerMsg::Joined {
                     player_id,
                     state,
-                })
+                }, should_spawn))
             }
             Err(e) => Err(e),
         }
@@ -300,11 +305,12 @@ mod tests {
     #[test]
     fn test_create_room() {
         let manager = RoomManager::new(6, 2500);
-        let (code, player_id, msg) = manager.create_room("Alice".to_string());
+        let (code, player_id, msg, should_spawn) = manager.create_room("Alice".to_string());
 
         assert_eq!(code.len(), 6);
         assert_eq!(player_id, 0);
         assert_eq!(manager.room_count(), 1);
+        assert!(should_spawn);
 
         match msg {
             ServerMsg::Created { code: c, player_id: pid, state } => {
@@ -320,13 +326,13 @@ mod tests {
     #[test]
     fn test_join_room() {
         let manager = RoomManager::new(6, 2500);
-        let (code, _, _) = manager.create_room("Alice".to_string());
+        let (code, _, _, _) = manager.create_room("Alice".to_string());
 
         let result = manager.join_room(&code, "Bob".to_string());
         assert!(result.is_ok());
 
         match result.unwrap() {
-            ServerMsg::Joined { player_id, state } => {
+            (ServerMsg::Joined { player_id, state }, _should_spawn) => {
                 assert_eq!(player_id, 1);
                 assert_eq!(state.players[player_id].name, "Bob");
                 assert_eq!(state.players[player_id].is_bot, false);
@@ -347,7 +353,7 @@ mod tests {
     #[test]
     fn test_join_room_full() {
         let manager = RoomManager::new(6, 2500);
-        let (code, _, _) = manager.create_room("Alice".to_string());
+        let (code, _, _, _) = manager.create_room("Alice".to_string());
         manager.join_room(&code, "Bob".to_string()).unwrap();
         manager.join_room(&code, "Charlie".to_string()).unwrap();
         manager.join_room(&code, "Dave".to_string()).unwrap();
@@ -360,7 +366,7 @@ mod tests {
     #[test]
     fn test_leave_room() {
         let manager = RoomManager::new(6, 2500);
-        let (code, _, _) = manager.create_room("Alice".to_string());
+        let (code, _, _, _) = manager.create_room("Alice".to_string());
         manager.join_room(&code, "Bob".to_string()).unwrap();
 
         let result = manager.leave_room(&code, 1);
@@ -380,7 +386,7 @@ mod tests {
     #[test]
     fn test_get_room() {
         let manager = RoomManager::new(6, 2500);
-        let (code, _, _) = manager.create_room("Alice".to_string());
+        let (code, _, _, _) = manager.create_room("Alice".to_string());
 
         let room = manager.get_room(&code);
         assert!(room.is_some());
@@ -390,19 +396,19 @@ mod tests {
     #[test]
     fn test_generate_code_length() {
         let manager = RoomManager::new(6, 2500);
-        let (code, _, _) = manager.create_room("Alice".to_string());
+        let (code, _, _, _) = manager.create_room("Alice".to_string());
         assert_eq!(code.len(), 6);
 
         let manager2 = RoomManager::new(8, 2500);
-        let (code2, _, _) = manager2.create_room("Bob".to_string());
+        let (code2, _, _, _) = manager2.create_room("Bob".to_string());
         assert_eq!(code2.len(), 8);
     }
 
     #[test]
     fn test_multiple_rooms() {
         let manager = RoomManager::new(6, 2500);
-        let (code1, _, _) = manager.create_room("Alice".to_string());
-        let (code2, _, _) = manager.create_room("Bob".to_string());
+        let (code1, _, _, _) = manager.create_room("Alice".to_string());
+        let (code2, _, _, _) = manager.create_room("Bob".to_string());
 
         assert_ne!(code1, code2);
         assert_eq!(manager.room_count(), 2);
@@ -411,7 +417,7 @@ mod tests {
     #[test]
     fn test_update_state() {
         let manager = RoomManager::new(6, 2500);
-        let (code, _, _) = manager.create_room("Alice".to_string());
+        let (code, _, _, _) = manager.create_room("Alice".to_string());
 
         let mut state = manager.get_state(&code).unwrap();
         state.log.push("test".to_string());
@@ -424,7 +430,7 @@ mod tests {
     #[test]
     fn test_code_is_alphanumeric() {
         let manager = RoomManager::new(6, 2500);
-        let (code, _, _) = manager.create_room("Alice".to_string());
+        let (code, _, _, _) = manager.create_room("Alice".to_string());
         assert!(code.chars().all(|c| c.is_alphanumeric()));
     }
 }

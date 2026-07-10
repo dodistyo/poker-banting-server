@@ -72,6 +72,7 @@ pub struct Room {
     pub state: GameState,
     pub players: Vec<RoomPlayer>,
     pub started: bool,
+    pub delay_task_spawned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +117,7 @@ impl Room {
             state,
             players,
             started: false,
+            delay_task_spawned: false,
         }
     }
 
