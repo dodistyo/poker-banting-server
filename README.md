@@ -1,12 +1,12 @@
 # Pocer Server
 
-Real-time poker game server built with Rust and Actix-web. WebSocket-based multiplayer with room management, bot support, and combo detection.
+Real-time card game server for Pocer (Capsa Banting). WebSocket-based multiplayer with room management, bot support, and combo detection.
 
 ## Tech Stack
 
 - **Runtime:** Rust (edition 2024)
-- **Web Framework:** actix-web 4
-- **WebSocket:** actix-ws 0.2
+- **Web Framework:** axum 0.8
+- **WebSocket:** axum `ws` feature
 - **Async:** tokio
 - **State:** dashmap (concurrent room storage)
 
@@ -23,8 +23,8 @@ cargo install cargo-watch
 ## Quick Start
 
 ```bash
-# Clone and enter
-cd pocer-server
+# Enter server directory
+cd server
 
 # Dev mode with hot reload
 just dev
@@ -69,6 +69,7 @@ just clean    # Clean target dir
 ```
 src/
 ├── main.rs        # Entry point, HTTP server setup
+├── lib.rs         # Library crate root
 ├── config.rs      # Environment configuration
 ├── protocol.rs    # WebSocket message types
 ├── rooms.rs       # Room manager (create, join, cleanup)
@@ -76,7 +77,8 @@ src/
 └── game/
     ├── mod.rs     # Game module
     ├── state.rs   # Game state machine
-    ├── rules.rs   # Poker rules engine
+    ├── engine.rs  # Game engine (trick flow, turns)
+    ├── rules.rs   # Game rules engine
     ├── card.rs    # Card and deck logic
     ├── combo.rs   # Hand evaluation / combos
     └── bot.rs     # AI bot player
