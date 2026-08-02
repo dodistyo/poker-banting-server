@@ -240,7 +240,7 @@ fn find_kicker(cards: &[Card], quad_rank: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::card::{create_deck, Card, Rank, Suit};
+    use crate::game::card::{Card, Rank, Suit};
 
     fn card(rank: Rank, suit: Suit) -> Card {
         Card::new(rank, suit)

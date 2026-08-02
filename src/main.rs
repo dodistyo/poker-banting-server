@@ -23,6 +23,12 @@ async fn health(State(rooms): State<Arc<RoomManager>>) -> Json<HealthResponse> {
     })
 }
 
+async fn list_rooms(
+    State(rooms): State<Arc<RoomManager>>,
+) -> Json<Vec<rooms::PublicRoomSummary>> {
+    Json(rooms.list_public_rooms())
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
@@ -33,6 +39,7 @@ async fn main() -> std::io::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/ws", get(ws::ws_index))
+        .route("/api/rooms", get(list_rooms))
         .with_state(rooms);
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)

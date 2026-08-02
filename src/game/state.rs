@@ -1,3 +1,4 @@
+use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use super::card::Card;
 use super::combo::ComboType;
@@ -53,6 +54,17 @@ pub enum GamePhase {
     GameOver,
 }
 
+impl std::fmt::Display for GamePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GamePhase::Lobby => write!(f, "lobby"),
+            GamePhase::ThreeDiscard => write!(f, "three_discard"),
+            GamePhase::Playing => write!(f, "playing"),
+            GamePhase::GameOver => write!(f, "game_over"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GameState {
@@ -73,6 +85,9 @@ pub struct Room {
     pub players: Vec<RoomPlayer>,
     pub started: bool,
     pub delay_task_spawned: bool,
+    pub is_public: bool,
+    #[serde(skip, default)]
+    pub disconnected_players: Vec<(usize, String, Instant)>, // (seat_id, token, disconnect_time)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,16 +97,19 @@ pub struct RoomPlayer {
     pub is_bot: bool,
     pub connected: bool,
     pub disconnect_time: Option<u64>,
+    #[serde(skip, default)]
+    pub token: Option<String>,
 }
 
 impl Room {
-    pub fn new(code: String, host_name: String) -> Self {
+    pub fn new(code: String, host_name: String, host_token: String) -> Self {
         let players = vec![RoomPlayer {
             id: 0,
             name: host_name.clone(),
             is_bot: false,
             connected: true,
             disconnect_time: None,
+            token: Some(host_token),
         }];
 
         let state = GameState {
@@ -118,10 +136,12 @@ impl Room {
             players,
             started: false,
             delay_task_spawned: false,
+            is_public: true,
+            disconnected_players: Vec::new(),
         }
     }
 
-    pub fn add_player(&mut self, name: String) -> Result<usize, String> {
+    pub fn add_player(&mut self, name: String, token: String) -> Result<usize, String> {
         if self.players.len() >= 4 {
             return Err("Room is full".to_string());
         }
@@ -136,6 +156,7 @@ impl Room {
             is_bot: false,
             connected: true,
             disconnect_time: None,
+            token: Some(token),
         });
 
         self.state.players.push(Player {
@@ -159,6 +180,7 @@ impl Room {
             is_bot: true,
             connected: true,
             disconnect_time: None,
+            token: None,
         });
 
         self.state.players.push(Player {
@@ -172,6 +194,37 @@ impl Room {
         self.state.scores.push(0);
 
         id
+    }
+
+    pub fn add_disconnected_player(&mut self, seat_id: usize, token: String) {
+        self.disconnected_players.push((seat_id, token, Instant::now()));
+    }
+
+    pub fn deal_and_start_discard(&mut self) {
+        let mut engine = crate::game::engine::GameEngine::new(self.state.clone());
+        engine.deal_cards();
+        engine.start_three_discard();
+        self.state = engine.state().clone();
+    }
+
+    pub fn restore_seat(&mut self, seat_id: usize, name: &str, token: &str) {
+        if seat_id < self.players.len() {
+            self.players[seat_id].name = name.to_string();
+            self.players[seat_id].is_bot = false;
+            self.players[seat_id].connected = true;
+            self.players[seat_id].disconnect_time = None;
+            self.players[seat_id].token = Some(token.to_string());
+        }
+        if seat_id < self.state.players.len() {
+            self.state.players[seat_id].name = name.to_string();
+            self.state.players[seat_id].is_bot = false;
+            self.state.players[seat_id].connected = true;
+        }
+    }
+
+    pub fn cleanup_expired_disconnected(&mut self, timeout_secs: u64) {
+        let cutoff = Instant::now() - std::time::Duration::from_secs(timeout_secs);
+        self.disconnected_players.retain(|(_, _, t)| *t > cutoff);
     }
 }
 
@@ -190,38 +243,41 @@ mod tests {
 
     #[test]
     fn test_room_new() {
-        let room = Room::new("ABC123".to_string(), "Host".to_string());
+        let room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
         assert_eq!(room.code, "ABC123");
         assert_eq!(room.players.len(), 1);
         assert_eq!(room.players[0].name, "Host");
+        assert_eq!(room.players[0].token, Some("host-token".to_string()));
         assert_eq!(room.state.phase, GamePhase::Lobby);
         assert!(!room.started);
     }
 
     #[test]
     fn test_room_add_player() {
-        let mut room = Room::new("ABC123".to_string(), "Host".to_string());
-        let id = room.add_player("Player1".to_string()).unwrap();
+        let mut room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
+        let id = room.add_player("Player1".to_string(), "p1-token".to_string()).unwrap();
         assert_eq!(id, 1);
         assert_eq!(room.players.len(), 2);
         assert_eq!(room.state.players.len(), 2);
+        assert_eq!(room.players[1].token, Some("p1-token".to_string()));
     }
 
     #[test]
     fn test_room_add_player_full() {
-        let mut room = Room::new("ABC123".to_string(), "Host".to_string());
-        room.add_player("P1".to_string()).unwrap();
-        room.add_player("P2".to_string()).unwrap();
-        room.add_player("P3".to_string()).unwrap();
-        assert!(room.add_player("P4".to_string()).is_err());
+        let mut room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
+        room.add_player("P1".to_string(), "t1".to_string()).unwrap();
+        room.add_player("P2".to_string(), "t2".to_string()).unwrap();
+        room.add_player("P3".to_string(), "t3".to_string()).unwrap();
+        assert!(room.add_player("P4".to_string(), "t4".to_string()).is_err());
     }
 
     #[test]
     fn test_room_add_bot() {
-        let mut room = Room::new("ABC123".to_string(), "Host".to_string());
+        let mut room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
         let id = room.add_bot("Bot1".to_string());
         assert_eq!(id, 1);
         assert!(room.players[1].is_bot);
+        assert!(room.players[1].token.is_none());
     }
 
     #[test]
@@ -267,9 +323,9 @@ mod tests {
 
     #[test]
     fn test_room_started_no_join() {
-        let mut room = Room::new("ABC123".to_string(), "Host".to_string());
+        let mut room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
         room.started = true;
-        assert!(room.add_player("Late".to_string()).is_err());
+        assert!(room.add_player("Late".to_string(), "late-token".to_string()).is_err());
     }
 
     #[test]
@@ -294,9 +350,32 @@ mod tests {
 
     #[test]
     fn test_room_scores_initialized() {
-        let mut room = Room::new("ABC123".to_string(), "Host".to_string());
+        let mut room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
         assert_eq!(room.state.scores, vec![0]);
-        room.add_player("P1".to_string()).unwrap();
+        room.add_player("P1".to_string(), "p1-token".to_string()).unwrap();
         assert_eq!(room.state.scores, vec![0, 0]);
+    }
+
+    #[test]
+    fn test_room_is_public_default() {
+        let room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
+        assert!(room.is_public);
+    }
+
+    #[test]
+    fn test_room_disconnected_player() {
+        let mut room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
+        room.add_disconnected_player(0, "alice-token".to_string());
+        assert_eq!(room.disconnected_players.len(), 1);
+        assert_eq!(room.disconnected_players[0].0, 0);
+        assert_eq!(room.disconnected_players[0].1, "alice-token");
+    }
+
+    #[test]
+    fn test_room_cleanup_expired_disconnected() {
+        let mut room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
+        room.add_disconnected_player(0, "alice-token".to_string());
+        room.cleanup_expired_disconnected(0);
+        assert!(room.disconnected_players.is_empty());
     }
 }

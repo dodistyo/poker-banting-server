@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use crate::game::state::GameState;
 
+const fn default_is_public() -> bool { true }
+
 // Client → Server messages
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9,11 +11,19 @@ pub enum ClientMsg {
     #[serde(rename = "create")]
     Create {
         name: String,
+        #[serde(default = "default_is_public")]
+        is_public: bool,
     },
     #[serde(rename = "join")]
     Join {
         code: String,
         name: String,
+    },
+    #[serde(rename = "rejoin")]
+    Rejoin {
+        code: String,
+        name: String,
+        token: String,
     },
     #[serde(rename = "play")]
     Play {
@@ -35,11 +45,22 @@ pub enum ServerMsg {
         code: String,
         player_id: usize,
         state: GameState,
+        is_public: bool,
+        token: String,
     },
     #[serde(rename = "joined")]
     Joined {
         player_id: usize,
         state: GameState,
+        code: String,
+        token: String,
+    },
+    #[serde(rename = "rejoined")]
+    Rejoined {
+        player_id: usize,
+        state: GameState,
+        code: String,
+        token: String,
     },
     #[serde(rename = "state")]
     State {
@@ -66,14 +87,17 @@ pub enum ServerMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::state::{GamePhase, Player, TrickState};
+    use crate::game::state::{GamePhase, TrickState};
 
     #[test]
     fn test_client_msg_create() {
         let json = r#"{"type":"create","name":"Alice"}"#;
         let msg: ClientMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ClientMsg::Create { name } => assert_eq!(name, "Alice"),
+            ClientMsg::Create { name, is_public } => {
+                assert_eq!(name, "Alice");
+                assert!(is_public);
+            }
             _ => panic!("Expected Create"),
         }
     }
@@ -131,10 +155,13 @@ mod tests {
             code: "ABC123".to_string(),
             player_id: 0,
             state,
+            is_public: true,
+            token: "abc123".to_string(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"created\""));
         assert!(json.contains("\"code\":\"ABC123\""));
+        assert!(json.contains("\"token\":\"abc123\""));
     }
 
     #[test]
@@ -180,5 +207,64 @@ mod tests {
         let msg = ServerMsg::Pong;
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"pong\""));
+    }
+
+    #[test]
+    fn test_client_msg_create_with_is_public() {
+        let json = r#"{"type":"create","name":"Alice","isPublic":false}"#;
+        let msg: ClientMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ClientMsg::Create { name, is_public } => {
+                assert_eq!(name, "Alice");
+                assert!(!is_public);
+            }
+            _ => panic!("Expected Create"),
+        }
+    }
+
+    #[test]
+    fn test_client_msg_create_default_is_public() {
+        let json = r#"{"type":"create","name":"Alice"}"#;
+        let msg: ClientMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ClientMsg::Create { name, is_public } => {
+                assert_eq!(name, "Alice");
+                assert!(is_public);
+            }
+            _ => panic!("Expected Create"),
+        }
+    }
+
+    #[test]
+    fn test_client_msg_rejoin() {
+        let json = r#"{"type":"rejoin","code":"ABC123","name":"Alice","token":"abc123"}"#;
+        let msg: ClientMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ClientMsg::Rejoin { code, name, token } => {
+                assert_eq!(code, "ABC123");
+                assert_eq!(name, "Alice");
+                assert_eq!(token, "abc123");
+            }
+            _ => panic!("Expected Rejoin"),
+        }
+    }
+
+    #[test]
+    fn test_server_msg_rejoined() {
+        let state = GameState {
+            phase: GamePhase::Lobby,
+            players: vec![],
+            current_player: 0,
+            trick: TrickState::new(),
+            finished_order: Vec::new(),
+            scores: vec![],
+            three_discard: None,
+            log: Vec::new(),
+        };
+        let msg = ServerMsg::Rejoined { player_id: 0, state, code: "ABC123".to_string(), token: "abc123".to_string() };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"rejoined\""));
+        assert!(json.contains("\"code\":\"ABC123\""));
+        assert!(json.contains("\"token\":\"abc123\""));
     }
 }

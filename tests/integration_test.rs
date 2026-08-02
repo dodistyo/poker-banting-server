@@ -165,7 +165,7 @@ fn test_bot_passes_when_cannot_beat() {
 
 #[test]
 fn test_protocol_create_roundtrip() {
-    let msg = ClientMsg::Create { name: "Alice".to_string() };
+    let msg = ClientMsg::Create { name: "Alice".to_string(), is_public: true };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("create"));
     assert!(json.contains("Alice"));
@@ -204,6 +204,8 @@ fn test_server_msg_created_serialization() {
         code: "ABC123".to_string(),
         player_id: 0,
         state,
+        is_public: true,
+        token: "abc123".to_string(),
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("created"));
@@ -217,7 +219,7 @@ fn test_server_msg_created_serialization() {
 fn test_room_create_and_join() {
     let rm = RoomManager::new(6, 2500);
 
-    let (code, pid, _msg, _) = rm.create_room("Alice".to_string());
+    let (code, pid, _msg, _) = rm.create_room("Alice".to_string(), true);
     assert_eq!(pid, 0);
     assert_eq!(code.len(), 6);
 
@@ -233,7 +235,7 @@ fn test_room_create_and_join() {
 fn test_room_max_players() {
     let rm = RoomManager::new(6, 2500);
 
-    let (code, _, _, _) = rm.create_room("Alice".to_string()); // 1 human + 3 bots
+    let (code, _, _, _) = rm.create_room("Alice".to_string(), true); // 1 human + 3 bots
     rm.join_room(&code, "Bob".to_string()).unwrap(); // Replaces bot
     rm.join_room(&code, "Charlie".to_string()).unwrap(); // Replaces bot
     rm.join_room(&code, "Dave".to_string()).unwrap(); // Replaces last bot
@@ -246,17 +248,19 @@ fn test_room_max_players() {
 fn test_room_leave_marks_disconnected() {
     let rm = RoomManager::new(6, 2500);
 
-    let (code, _, _, _) = rm.create_room("Alice".to_string());
+    let (code, _, _, _) = rm.create_room("Alice".to_string(), true);
     rm.join_room(&code, "Bob".to_string()).unwrap(); // Auto-fills to 4
 
     let room = rm.get_room(&code).unwrap();
     assert_eq!(room.players.len(), 4);
 
-    // Leave marks player as disconnected, doesn't remove from room
+    // Leave replaces human with bot, doesn't remove from room
     rm.leave_room(&code, 1);
     let room = rm.get_room(&code).unwrap();
     assert_eq!(room.players.len(), 4);
-    assert!(!room.players[1].connected);
+    assert!(room.players[1].is_bot);
+    assert!(room.players[1].connected);
+    assert_eq!(room.players[1].name, "Bot (Bob)");
 }
 
 #[test]
