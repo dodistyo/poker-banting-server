@@ -186,6 +186,66 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                     }
                 }
             }
+            ClientMsg::Ready { ready } => {
+                if room_code.is_none() || player_id.is_none() {
+                    continue;
+                }
+                let code = room_code.clone().unwrap();
+                let pid = player_id.unwrap();
+                match rooms.ready_player(&code, pid, ready) {
+                    Ok(server_msg) => {
+                        let _ = ws_tx.send(Message::Text(
+                            serde_json::to_string(&server_msg).unwrap().into(),
+                        ));
+                    }
+                    Err(err) => {
+                        let _ = ws_tx.send(Message::Text(
+                            serde_json::to_string(&ServerMsg::Error {
+                                message: err,
+                            }).unwrap().into(),
+                        ));
+                    }
+                }
+            }
+            ClientMsg::StartGame => {
+                if room_code.is_none() || player_id.is_none() {
+                    continue;
+                }
+                let code = room_code.clone().unwrap();
+                let pid = player_id.unwrap();
+                match rooms.start_game(&code, pid) {
+                    Ok((server_msg, should_spawn)) => {
+                        let _ = ws_tx.send(Message::Text(
+                            serde_json::to_string(&server_msg).unwrap().into(),
+                        ));
+                        if should_spawn {
+                            let rooms_clone = rooms.clone();
+                            let code_clone = code.clone();
+                            tokio::spawn(async move {
+                                rooms_clone.process_three_discard_delayed(&code_clone).await;
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        let _ = ws_tx.send(Message::Text(
+                            serde_json::to_string(&ServerMsg::Error {
+                                message: err,
+                            }).unwrap().into(),
+                        ));
+                    }
+                }
+            }
+            ClientMsg::LeaveRoom => {
+                if let (Some(code), Some(pid)) = (&room_code, player_id) {
+                    if let Some(msg) = rooms.remove_player(&code, pid) {
+                        let _ = ws_tx.send(Message::Text(
+                            serde_json::to_string(&msg).unwrap().into(),
+                        ));
+                    }
+                }
+                cleaned_up = true;
+                break;
+            }
             ClientMsg::Ping => {
                 let _ = ws_tx.send(Message::Text(
                     serde_json::to_string(&ServerMsg::Pong).unwrap().into(),

@@ -31,6 +31,14 @@ pub enum ClientMsg {
     },
     #[serde(rename = "pass")]
     Pass,
+    #[serde(rename = "ready")]
+    Ready {
+        ready: bool,
+    },
+    #[serde(rename = "startGame")]
+    StartGame,
+    #[serde(rename = "leaveRoom")]
+    LeaveRoom,
     #[serde(rename = "ping")]
     Ping,
 }
@@ -76,6 +84,14 @@ pub enum ServerMsg {
         player_id: usize,
         name: String,
     },
+    #[serde(rename = "playerReady")]
+    PlayerReady {
+        player_id: usize,
+        name: String,
+        ready: bool,
+    },
+    #[serde(rename = "gameStarted")]
+    GameStarted,
     #[serde(rename = "error")]
     Error {
         message: String,
@@ -144,6 +160,7 @@ mod tests {
         let state = GameState {
             phase: GamePhase::Lobby,
             players: vec![],
+            ready: vec![],
             current_player: 0,
             trick: TrickState::new(),
             finished_order: Vec::new(),
@@ -179,6 +196,7 @@ mod tests {
         let state = GameState {
             phase: GamePhase::Playing,
             players: vec![],
+            ready: vec![],
             current_player: 0,
             trick: TrickState::new(),
             finished_order: Vec::new(),
@@ -254,6 +272,7 @@ mod tests {
         let state = GameState {
             phase: GamePhase::Lobby,
             players: vec![],
+            ready: vec![],
             current_player: 0,
             trick: TrickState::new(),
             finished_order: Vec::new(),

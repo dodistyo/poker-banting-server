@@ -8,7 +8,8 @@ pub struct Config {
     pub max_players: usize,
     pub disconnect_timeout_sec: u64,
     pub bot_turn_delay_ms: u64,
-}
+    pub room_orphan_timeout_secs: u64,
+  }
 
 impl Config {
     pub fn new() -> Self {
@@ -38,6 +39,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2500),
+            room_orphan_timeout_secs: env::var("ROOM_ORPHAN_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
         }
     }
 }
@@ -56,5 +61,6 @@ mod tests {
         assert_eq!(config.max_players, 4);
         assert_eq!(config.disconnect_timeout_sec, 15);
         assert_eq!(config.bot_turn_delay_ms, 2500);
+        assert_eq!(config.room_orphan_timeout_secs, 30);
     }
 }

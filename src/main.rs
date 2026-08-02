@@ -34,7 +34,7 @@ async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
 
     let config = Config::new();
-    let rooms = Arc::new(RoomManager::new(config.room_code_length, config.bot_turn_delay_ms));
+    let rooms = Arc::new(RoomManager::new(config.room_code_length, config.bot_turn_delay_ms, config.room_orphan_timeout_secs, config.disconnect_timeout_sec));
 
     let app = Router::new()
         .route("/health", get(health))

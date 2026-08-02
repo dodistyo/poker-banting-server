@@ -445,11 +445,12 @@ mod tests {
         let mut state = GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true },
-                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 0,
             trick: TrickState {
                 cards: vec![card(Rank::Three, Suit::Diamonds)],
@@ -475,11 +476,12 @@ mod tests {
         let mut state = GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true },
-                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true },
-                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true },
-                Player { id: 3, name: "P3".to_string(), hand: vec![card(Rank::Two, Suit::Spades)], finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: vec![card(Rank::Two, Suit::Spades)], finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 3,
             trick: TrickState::new(),
             finished_order: vec![0, 1, 2],
@@ -497,11 +499,12 @@ mod tests {
         let mut state = GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true },
-                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 1,
             trick: TrickState::new(),
             finished_order: vec![0],
@@ -518,11 +521,12 @@ mod tests {
         let mut state = GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 0,
             trick: TrickState::new(),
             finished_order: Vec::new(),
@@ -542,11 +546,12 @@ mod tests {
         let state = GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 0,
             trick: TrickState::new(),
             finished_order: Vec::new(),
@@ -562,11 +567,12 @@ mod tests {
         let state = GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 3,
             trick: TrickState::new(),
             finished_order: Vec::new(),
@@ -582,11 +588,12 @@ mod tests {
         let mut state = GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 0,
             trick: TrickState::new(),
             finished_order: Vec::new(),
@@ -622,11 +629,12 @@ mod tests {
         let state = GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 0,
             trick: TrickState {
                 cards: vec![card(Rank::Three, Suit::Diamonds)],
@@ -649,11 +657,12 @@ mod tests {
         let state = GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 0,
           trick: TrickState {
                 cards: vec![card(Rank::Three, Suit::Diamonds)],
@@ -676,11 +685,12 @@ mod tests {
         let state = GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: true, is_bot: true, connected: true },
-                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: true, is_bot: true, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 0,
             trick: TrickState {
                 cards: vec![card(Rank::Two, Suit::Spades)],

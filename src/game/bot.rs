@@ -231,11 +231,12 @@ mod tests {
         GameState {
             phase: GamePhase::Playing,
             players: vec![
-                Player { id: 0, name: "P0".to_string(), hand, finished: false, is_bot: false, connected: true },
-                Player { id: 1, name: "Bot1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 2, name: "Bot2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
-                Player { id: 3, name: "Bot3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true },
+                Player { id: 0, name: "P0".to_string(), hand, finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "Bot1".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "Bot2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "Bot3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
             ],
+            ready: vec![true; 4],
             current_player: 0,
             trick: TrickState::new(),
             finished_order: Vec::new(),

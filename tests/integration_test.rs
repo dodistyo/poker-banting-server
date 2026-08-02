@@ -18,6 +18,7 @@ fn make_player(id: usize, name: &str, hand: Vec<Card>) -> Player {
         finished: false,
         is_bot: false,
         connected: true,
+        is_creator: false,
     }
 }
 
@@ -30,6 +31,7 @@ fn empty_state() -> GameState {
             make_player(2, "P2", Vec::new()),
             make_player(3, "P3", Vec::new()),
         ],
+        ready: vec![true; 4],
         current_player: 0,
         trick: TrickState::new(),
         finished_order: Vec::new(),
@@ -217,7 +219,7 @@ fn test_server_msg_created_serialization() {
 
 #[test]
 fn test_room_create_and_join() {
-    let rm = RoomManager::new(6, 2500);
+    let rm = RoomManager::new(6, 2500, 30, 15);
 
     let (code, pid, _msg, _) = rm.create_room("Alice".to_string(), true);
     assert_eq!(pid, 0);
@@ -233,7 +235,7 @@ fn test_room_create_and_join() {
 
 #[test]
 fn test_room_max_players() {
-    let rm = RoomManager::new(6, 2500);
+    let rm = RoomManager::new(6, 2500, 30, 15);
 
     let (code, _, _, _) = rm.create_room("Alice".to_string(), true); // 1 human + 3 bots
     rm.join_room(&code, "Bob".to_string()).unwrap(); // Replaces bot
@@ -246,26 +248,25 @@ fn test_room_max_players() {
 
 #[test]
 fn test_room_leave_marks_disconnected() {
-    let rm = RoomManager::new(6, 2500);
+    let rm = RoomManager::new(6, 2500, 30, 15);
 
     let (code, _, _, _) = rm.create_room("Alice".to_string(), true);
-    rm.join_room(&code, "Bob".to_string()).unwrap(); // Auto-fills to 4
+    rm.join_room(&code, "Bob".to_string()).unwrap();
 
     let room = rm.get_room(&code).unwrap();
-    assert_eq!(room.players.len(), 4);
+    assert_eq!(room.players.len(), 2);
 
-    // Leave replaces human with bot, doesn't remove from room
+    // Non-creator leave in lobby: room stays, player marked disconnected
     rm.leave_room(&code, 1);
     let room = rm.get_room(&code).unwrap();
-    assert_eq!(room.players.len(), 4);
-    assert!(room.players[1].is_bot);
-    assert!(room.players[1].connected);
-    assert_eq!(room.players[1].name, "Bot (Bob)");
+    assert_eq!(room.players.len(), 2);
+    assert!(!room.players[1].connected);
+    assert_eq!(room.disconnected_players.len(), 1);
 }
 
 #[test]
 fn test_room_invalid_code() {
-    let rm = RoomManager::new(6, 2500);
+    let rm = RoomManager::new(6, 2500, 30, 15);
 
     let result = rm.join_room("INVALID", "Alice".to_string());
     assert!(result.is_err());

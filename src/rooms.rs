@@ -10,18 +10,6 @@ use crate::game::state::{Room, GameState, GamePhase};
 use crate::game::rules::{process_three_discard, process_one_bot_turn};
 use crate::protocol::ServerMsg;
 
-const ANIMALS: &[&str] = &[
-    "Fox", "Wolf", "Bear", "Eagle", "Shark", "Tiger", "Lion", "Hawk",
-    "Panda", "Otter", "Raven", "Falcon", "Cobra", "Panther", "Hare",
-    "Badger", "Jaguar", "Osprey", "Coyote", "Stag", "Mantis", "Viper",
-];
-
-fn random_animal_name() -> String {
-    let animal = ANIMALS[thread_rng().gen_range(0..ANIMALS.len())];
-    let number = thread_rng().gen_range(10..99);
-    format!("BOT-{}{}", animal, number)
-}
-
 #[derive(serde::Serialize, Clone)]
 pub struct PublicRoomSummary {
     pub code: String,
@@ -38,15 +26,19 @@ pub struct RoomManager {
     sessions: Arc<DashMap<String, Vec<SessionSender>>>,
     code_length: usize,
     bot_turn_delay_ms: u64,
+    orphan_timeout_secs: u64,
+    lobby_disconnect_timeout_secs: u64,
 }
 
 impl RoomManager {
-    pub fn new(code_length: usize, bot_turn_delay_ms: u64) -> Self {
+    pub fn new(code_length: usize, bot_turn_delay_ms: u64, orphan_timeout_secs: u64, lobby_disconnect_timeout_secs: u64) -> Self {
         RoomManager {
             rooms: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             code_length,
             bot_turn_delay_ms,
+            orphan_timeout_secs,
+            lobby_disconnect_timeout_secs,
         }
     }
 
@@ -69,17 +61,6 @@ impl RoomManager {
         let mut room = Room::new(code.clone(), host_name.clone(), token);
         room.is_public = is_public;
 
-        while room.players.len() < 4 {
-            room.add_bot(random_animal_name());
-        }
-
-        let should_spawn = room.players.len() >= 4 && !room.started;
-        if should_spawn {
-            room.started = true;
-            room.delay_task_spawned = true;
-            room.deal_and_start_discard();
-        }
-
         self.rooms.insert(code.clone(), room);
 
         let state = self.rooms.get(&code).unwrap().value().state.clone();
@@ -96,7 +77,7 @@ impl RoomManager {
                 is_public,
                 token,
             },
-            should_spawn,
+            false,
         )
     }
 
@@ -105,52 +86,16 @@ impl RoomManager {
         let token = Self::generate_token();
         let mut room = self.rooms.get_mut(&code).ok_or("Room not found")?;
 
+        if room.state.phase != GamePhase::Lobby {
+            return Err("Game already started".to_string());
+        }
+
         if room.players.len() >= 4 {
-            if let Some(bot_idx) = room.players.iter().position(|p| p.is_bot) {
-                room.players[bot_idx].name = name.clone();
-                room.players[bot_idx].is_bot = false;
-                room.players[bot_idx].connected = true;
-                room.players[bot_idx].disconnect_time = None;
-                room.players[bot_idx].token = Some(token.clone());
-
-                if bot_idx < room.state.players.len() {
-                    room.state.players[bot_idx].name = name.clone();
-                    room.state.players[bot_idx].is_bot = false;
-                    room.state.players[bot_idx].connected = true;
-                }
-                let player_id = bot_idx;
-
-                let state = room.state.clone();
-                drop(room);
-
-                self.broadcast(&code, ServerMsg::PlayerJoined {
-                    player_id,
-                    name: name.clone(),
-                });
-
-                return Ok((ServerMsg::Joined {
-                    player_id,
-                    state,
-                    code: code.clone(),
-                    token,
-                }, false));
-            }
             return Err("Room is full".to_string());
         }
 
         match room.add_player(name, token.clone()) {
             Ok(player_id) => {
-                while room.players.len() < 4 {
-                    room.add_bot(random_animal_name());
-                }
-
-                let should_spawn = room.players.len() >= 4 && !room.started && !room.delay_task_spawned;
-                if room.players.len() >= 4 && !room.started {
-                    room.started = true;
-                    room.delay_task_spawned = true;
-                    room.deal_and_start_discard();
-                }
-
                 let state = room.state.clone();
                 drop(room);
 
@@ -161,16 +106,14 @@ impl RoomManager {
                     name: player_name.unwrap_or_else(|| format!("Player {}", player_id)),
                 });
 
-                if state.phase != GamePhase::Lobby {
-                    self.broadcast(&code, ServerMsg::State { state: state.clone() });
-                }
+                self.broadcast(&code, ServerMsg::State { state: state.clone() });
 
                 Ok((ServerMsg::Joined {
                     player_id,
                     state,
                     code: code.clone(),
                     token,
-                }, should_spawn))
+                }, false))
             }
             Err(e) => Err(e),
         }
@@ -188,6 +131,7 @@ impl RoomManager {
             let (seat_id, _, _) = room.disconnected_players.remove(pos);
 
             room.restore_seat(seat_id, name, token);
+            room.human_reconnected();
 
             let state = room.state.clone();
             drop(room);
@@ -211,15 +155,61 @@ impl RoomManager {
     pub fn leave_room(&self, code: &str, player_id: usize) -> Option<ServerMsg> {
         let mut room = self.rooms.get_mut(code)?;
 
-        let (player_name, is_bot, token) = {
+        let (player_name, is_bot, token, is_creator) = {
             let player = room.players.iter().find(|p| p.id == player_id)?;
-            (player.name.clone(), player.is_bot, player.token.clone())
+            (player.name.clone(), player.is_bot, player.token.clone(), player.is_creator)
         };
 
+        if room.state.phase == GamePhase::Lobby && is_creator && is_bot == false && room.is_public {
+            drop(room);
+            self.rooms.remove(code);
+            self.sessions.remove(code);
+            return Some(ServerMsg::PlayerLeft {
+                player_id,
+                name: player_name,
+            });
+        }
+
         if !is_bot {
-            // Human player: track disconnected, auto-replace with bot
             if let Some(t) = token {
                 room.add_disconnected_player(player_id, t);
+            }
+
+            if room.state.phase == GamePhase::Lobby {
+                if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
+                    player.connected = false;
+                    player.disconnect_time = Some(std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs());
+                }
+                if is_creator {
+                    if let Some(new_creator) = room.players.iter().position(|p| !p.is_bot && p.connected && p.id != player_id) {
+                        room.players[new_creator].is_creator = true;
+                    }
+                }
+                let msg = ServerMsg::PlayerLeft {
+                    player_id,
+                    name: player_name,
+                };
+                let removed = room.cleanup_disconnected_lobby_players(self.lobby_disconnect_timeout_secs);
+                for (rid, rname) in &removed {
+                    self.broadcast(code, ServerMsg::PlayerLeft {
+                        player_id: *rid,
+                        name: rname.clone(),
+                    });
+                }
+                room.record_human_disconnect();
+                if room.is_orphaned(self.orphan_timeout_secs) {
+                    drop(room);
+                    self.rooms.remove(code);
+                    self.sessions.remove(code);
+                } else {
+                    let state = room.state.clone();
+                    drop(room);
+                    self.broadcast(code, ServerMsg::State { state });
+                }
+                return Some(msg);
             }
 
             if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
@@ -236,20 +226,26 @@ impl RoomManager {
             }
 
             let state = room.state.clone();
+            room.record_human_disconnect();
+            let orphaned = room.is_orphaned(self.orphan_timeout_secs);
             drop(room);
 
-            self.broadcast(&code, ServerMsg::PlayerLeft {
-                player_id,
-                name: player_name.clone(),
-            });
-            self.broadcast(&code, ServerMsg::State { state });
+            if orphaned {
+                self.rooms.remove(code);
+                self.sessions.remove(code);
+            } else {
+                self.broadcast(&code, ServerMsg::PlayerLeft {
+                    player_id,
+                    name: player_name.clone(),
+                });
+                self.broadcast(&code, ServerMsg::State { state });
+            }
             return Some(ServerMsg::PlayerLeft {
                 player_id,
                 name: player_name,
             });
         }
 
-        // Bot player: just mark disconnected
         if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
             player.connected = false;
             player.disconnect_time = Some(std::time::SystemTime::now()
@@ -264,6 +260,61 @@ impl RoomManager {
         };
 
         Some(msg)
+    }
+
+    pub fn remove_player(&self, code: &str, player_id: usize) -> Option<ServerMsg> {
+        let mut room = self.rooms.get_mut(code)?;
+
+        let (player_name, is_bot, is_creator) = {
+            let player = room.players.iter().find(|p| p.id == player_id)?;
+            (player.name.clone(), player.is_bot, player.is_creator)
+        };
+
+        if is_bot {
+            return None;
+        }
+
+        if room.state.phase == GamePhase::Lobby {
+            if is_creator {
+                let is_public = room.is_public;
+                if is_public {
+                    drop(room);
+                    self.rooms.remove(code);
+                    self.sessions.remove(code);
+                    return Some(ServerMsg::PlayerLeft {
+                        player_id,
+                        name: player_name,
+                    });
+                }
+            }
+
+            if let Some(new_creator) = room.players.iter().position(|p| !p.is_bot && p.id != player_id) {
+                room.players[new_creator].is_creator = true;
+            }
+
+            let token = room.players.iter().find(|p| p.id == player_id).and_then(|p| p.token.clone());
+            if let Some(t) = token {
+                room.add_disconnected_player(player_id, t);
+            }
+
+            room.players.retain(|p| p.id != player_id);
+            room.state.players.retain(|p| p.id != player_id);
+
+            let state = room.state.clone();
+            drop(room);
+
+            self.broadcast(code, ServerMsg::PlayerLeft {
+                player_id,
+                name: player_name.clone(),
+            });
+            self.broadcast(code, ServerMsg::State { state });
+            return Some(ServerMsg::PlayerLeft {
+                player_id,
+                name: player_name,
+            });
+        }
+
+        None
     }
 
     pub fn get_room(&self, code: &str) -> Option<Room> {
@@ -318,7 +369,7 @@ impl RoomManager {
         let mut result = Vec::new();
         for entry in self.rooms.iter() {
             let room = entry.value();
-            if room.is_public && room.state.phase != GamePhase::GameOver {
+            if room.is_public && room.state.phase == GamePhase::Lobby {
                 result.push(PublicRoomSummary {
                     code: room.code.clone(),
                     players: room.players.iter().filter(|p| !p.is_bot).count(),
@@ -329,6 +380,36 @@ impl RoomManager {
             }
         }
         result
+    }
+
+    pub fn ready_player(&self, code: &str, player_id: usize, ready: bool) -> Result<ServerMsg, String> {
+        let mut room = self.rooms.get_mut(code).ok_or("Room not found")?;
+        room.set_ready(player_id, ready)?;
+        let player_name = room.players.iter().find(|p| p.id == player_id)
+            .map(|p| p.name.clone()).unwrap_or_default();
+        drop(room);
+        Ok(ServerMsg::PlayerReady {
+            player_id,
+            name: player_name,
+            ready,
+        })
+    }
+
+    pub fn start_game(&self, code: &str, player_id: usize) -> Result<(ServerMsg, bool), String> {
+        let mut room = self.rooms.get_mut(code).ok_or("Room not found")?;
+        if !room.players.iter().any(|p| p.id == player_id && p.is_creator) {
+            return Err("Only the room creator can start the game".to_string());
+        }
+        if !room.all_human_ready() {
+            return Err("Not all players are ready".to_string());
+        }
+        room.start_game();
+        let should_spawn = true;
+        let state = room.state.clone();
+        drop(room);
+        self.broadcast(code, ServerMsg::GameStarted);
+        self.broadcast(code, ServerMsg::State { state: state.clone() });
+        Ok((ServerMsg::State { state }, should_spawn))
     }
 
     fn generate_code(&self) -> String {
@@ -437,20 +518,20 @@ mod tests {
 
     #[test]
     fn test_create_room() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, player_id, msg, should_spawn) = manager.create_room("Alice".to_string(), true);
 
         assert_eq!(code.len(), 6);
         assert_eq!(player_id, 0);
         assert_eq!(manager.room_count(), 1);
-        assert!(should_spawn);
+        assert!(!should_spawn);
 
         match msg {
             ServerMsg::Created { code: c, player_id: pid, state, .. } => {
                 assert_eq!(c, code);
                 assert_eq!(pid, 0);
-                assert_eq!(state.players.len(), 4);
-                assert_eq!(state.phase, GamePhase::ThreeDiscard);
+                assert_eq!(state.players.len(), 1);
+                assert_eq!(state.phase, GamePhase::Lobby);
             }
             _ => panic!("Expected Created"),
         }
@@ -458,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_join_room() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
 
         let result = manager.join_room(&code, "Bob".to_string());
@@ -469,7 +550,8 @@ mod tests {
                 assert_eq!(player_id, 1);
                 assert_eq!(state.players[player_id].name, "Bob");
                 assert_eq!(state.players[player_id].is_bot, false);
-                assert_eq!(state.players.len(), 4);
+                assert_eq!(state.players.len(), 2);
+                assert_eq!(state.phase, GamePhase::Lobby);
             }
             _ => panic!("Expected Joined"),
         }
@@ -477,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_join_room_not_found() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let result = manager.join_room("XXXXXX", "Bob".to_string());
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Room not found");
@@ -485,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_join_room_full() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         manager.join_room(&code, "Bob".to_string()).unwrap();
         manager.join_room(&code, "Charlie".to_string()).unwrap();
@@ -497,10 +579,74 @@ mod tests {
     }
 
     #[test]
-    fn test_leave_room() {
-        let manager = RoomManager::new(6, 2500);
+    fn test_start_game() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         manager.join_room(&code, "Bob".to_string()).unwrap();
+
+        // Not all ready, should fail
+        let result = manager.start_game(&code, 0);
+        assert!(result.is_err());
+
+        // Ready Bob
+        manager.ready_player(&code, 1, true).unwrap();
+
+        // Start game as creator
+        let result = manager.start_game(&code, 0);
+        assert!(result.is_ok());
+
+        let room = manager.get_room(&code).unwrap();
+        assert!(room.started);
+        assert_eq!(room.players.len(), 4);
+        assert_eq!(room.state.phase, GamePhase::ThreeDiscard);
+    }
+
+    #[test]
+    fn test_start_game_non_creator() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.ready_player(&code, 1, true).unwrap();
+
+        let result = manager.start_game(&code, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_leave_room_creator_dissolves_public() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+
+        manager.leave_room(&code, 0);
+        assert_eq!(manager.room_count(), 0);
+    }
+
+    #[test]
+    fn test_public_room_listing_only_lobby() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+        let (code1, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.create_room("Bob".to_string(), false);
+
+        let room_list = manager.list_public_rooms();
+        assert_eq!(room_list.len(), 1);
+        assert_eq!(room_list[0].code, code1);
+        assert_eq!(room_list[0].players, 1);
+        assert_eq!(room_list[0].phase, "lobby");
+
+        // Start the game, should no longer appear
+        manager.start_game(&code1, 0).unwrap();
+        let room_list = manager.list_public_rooms();
+        assert_eq!(room_list.len(), 0);
+    }
+
+    #[test]
+    fn test_leave_room() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
 
         let result = manager.leave_room(&code, 1);
         assert!(result.is_some());
@@ -522,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_get_room() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
 
         let room = manager.get_room(&code);
@@ -532,18 +678,18 @@ mod tests {
 
     #[test]
     fn test_generate_code_length() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         assert_eq!(code.len(), 6);
 
-        let manager2 = RoomManager::new(8, 2500);
+        let manager2 = RoomManager::new(8, 2500, 30, 15);
         let (code2, _, _, _) = manager2.create_room("Bob".to_string(), true);
         assert_eq!(code2.len(), 8);
     }
 
     #[test]
     fn test_multiple_rooms() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code1, _, _, _) = manager.create_room("Alice".to_string(), true);
         let (code2, _, _, _) = manager.create_room("Bob".to_string(), true);
 
@@ -553,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_update_state() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
 
         let mut state = manager.get_state(&code).unwrap();
@@ -566,20 +712,23 @@ mod tests {
 
     #[test]
     fn test_code_is_alphanumeric() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         assert!(code.chars().all(|c| c.is_alphanumeric()));
     }
 
     #[test]
     fn test_rejoin_restores_seat() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         let (joined_msg, _) = manager.join_room(&code, "Bob".to_string()).unwrap();
         let token = match &joined_msg {
             ServerMsg::Joined { token, .. } => token.clone(),
             _ => panic!("Expected Joined"),
         };
+
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
 
         manager.leave_room(&code, 1);
         let room = manager.get_room(&code).unwrap();
@@ -603,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_rejoin_not_found() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         let result = manager.rejoin_room(&code, "Unknown", "nonexistent-token");
         assert!(result.is_err());
@@ -611,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_leave_room_tracks_disconnected() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         let (joined_msg, _) = manager.join_room(&code, "Bob".to_string()).unwrap();
         let token = match &joined_msg {
@@ -619,6 +768,8 @@ mod tests {
             _ => panic!("Expected Joined"),
         };
 
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
         manager.leave_room(&code, 1);
 
         let room = manager.get_room(&code).unwrap();
@@ -629,10 +780,13 @@ mod tests {
 
     #[test]
     fn test_leave_room_bot_not_tracked() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
 
-        manager.leave_room(&code, 1);
+        manager.leave_room(&code, 2);
 
         let room = manager.get_room(&code).unwrap();
         assert!(room.disconnected_players.is_empty());
@@ -640,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_public_room_listing() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         manager.create_room("Alice".to_string(), true);
         manager.create_room("Bob".to_string(), false);
 
@@ -649,12 +803,12 @@ mod tests {
         assert_eq!(room_list[0].players, 1);
         assert_eq!(room_list[0].max_players, 4);
         assert_eq!(room_list[0].host, "Alice");
-        assert_eq!(room_list[0].phase, "three_discard");
+        assert_eq!(room_list[0].phase, "lobby");
     }
 
     #[test]
     fn test_rejoin_timeout_expired() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         let (joined_msg, _) = manager.join_room(&code, "Bob".to_string()).unwrap();
         let token = match &joined_msg {
@@ -662,6 +816,8 @@ mod tests {
             _ => panic!("Expected Joined"),
         };
 
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
         manager.leave_room(&code, 1);
         let room = manager.get_room(&code).unwrap();
         assert_eq!(room.disconnected_players.len(), 1);
@@ -678,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_full_rejoin_flow() {
-        let manager = RoomManager::new(6, 2500);
+        let manager = RoomManager::new(6, 2500, 30, 15);
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         let (joined_msg, _) = manager.join_room(&code, "Bob".to_string()).unwrap();
         let token = match &joined_msg {
@@ -686,6 +842,8 @@ mod tests {
             _ => panic!("Expected Joined"),
         };
 
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
         manager.leave_room(&code, 1);
 
         let result = manager.rejoin_room(&code, "Bob", &token);
@@ -701,5 +859,150 @@ mod tests {
 
         let room = manager.get_room(&code).unwrap();
         assert!(!room.disconnected_players.iter().any(|(_, t, _)| t == &token));
+    }
+
+    #[test]
+    fn test_orphaned_room_removed_immediate() {
+        let manager = RoomManager::new(6, 2500, 0, 0);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
+
+        manager.leave_room(&code, 1);
+        assert_eq!(manager.room_count(), 1);
+
+        manager.leave_room(&code, 0);
+        assert_eq!(manager.room_count(), 0);
+    }
+
+    #[test]
+    fn test_orphaned_room_not_removed_within_timeout() {
+        let manager = RoomManager::new(6, 2500, 60, 15);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
+
+        manager.leave_room(&code, 1);
+        assert_eq!(manager.room_count(), 1);
+
+        manager.leave_room(&code, 0);
+        assert_eq!(manager.room_count(), 1);
+    }
+
+    #[test]
+    fn test_rejoin_resets_orphan_timer() {
+        let manager = RoomManager::new(6, 2500, 0, 0);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        let (joined_msg, _) = manager.join_room(&code, "Bob".to_string()).unwrap();
+        let token = match &joined_msg {
+            ServerMsg::Joined { token, .. } => token.clone(),
+            _ => panic!("Expected Joined"),
+        };
+
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
+
+        manager.leave_room(&code, 1);
+        assert_eq!(manager.room_count(), 1);
+
+        let result = manager.rejoin_room(&code, "Bob", &token);
+        assert!(result.is_ok());
+        assert_eq!(manager.room_count(), 1);
+    }
+
+    #[test]
+    fn test_orphaned_room_removed_in_lobby() {
+        let manager = RoomManager::new(6, 2500, 0, 0);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+
+        manager.leave_room(&code, 1);
+        assert_eq!(manager.room_count(), 1);
+
+        manager.leave_room(&code, 0);
+        assert_eq!(manager.room_count(), 0);
+    }
+
+    #[test]
+    fn test_lobby_disconnected_player_removed_after_timeout() {
+        let manager = RoomManager::new(6, 2500, 60, 0);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), false);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.join_room(&code, "Charlie".to_string()).unwrap();
+
+        assert_eq!(manager.get_room(&code).unwrap().players.len(), 3);
+
+        manager.leave_room(&code, 0);
+
+        assert_eq!(manager.room_count(), 1);
+        let room = manager.get_room(&code).unwrap();
+        assert!(!room.players.iter().any(|p| p.name == "Alice"));
+        assert_eq!(room.players.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_player_instant_from_lobby() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+
+        let result = manager.remove_player(&code, 1);
+        assert!(result.is_some());
+
+        let room = manager.get_room(&code).unwrap();
+        assert_eq!(room.players.len(), 1);
+        assert_eq!(room.players[0].name, "Alice");
+    }
+
+    #[test]
+    fn test_remove_player_creator_dissolves_public() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+
+        let result = manager.remove_player(&code, 0);
+        assert!(result.is_some());
+
+        assert_eq!(manager.room_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_player_transfers_creator_private() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), false);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+
+        let result = manager.remove_player(&code, 0);
+        assert!(result.is_some());
+
+        let room = manager.get_room(&code).unwrap();
+        assert_eq!(room.players.len(), 1);
+        assert_eq!(room.players[0].name, "Bob");
+        assert!(room.players[0].is_creator);
+    }
+
+    #[test]
+    fn test_remove_player_bot_returns_none() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
+
+        let room = manager.get_room(&code).unwrap();
+        let bot_id = room.players.iter().position(|p| p.is_bot).unwrap();
+
+        assert!(manager.remove_player(&code, bot_id).is_none());
     }
 }
