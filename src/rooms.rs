@@ -49,10 +49,14 @@ impl RoomManager {
     pub fn remove_session(&self, code: &str, sender: &Arc<UnboundedSender<Message>>) {
         if let Some(mut entry) = self.sessions.get_mut(code) {
             entry.retain(|s| !Arc::ptr_eq(s, sender));
-            if entry.is_empty() {
-                self.sessions.remove(code);
-            }
         }
+        // Drop the entry guard BEFORE touching the map again. Re-locking the
+        // shard while holding a get_mut() guard can deadlock when a writer is
+        // queued on that shard (observed: a mid-game disconnect wedged the
+        // whole server, /health stopped answering). remove_if is atomic:
+        // it removes the key only if it is still empty, so a concurrent
+        // add_session can't be clobbered.
+        self.sessions.remove_if(code, |_, v| v.is_empty());
     }
 
     pub fn create_room(&self, host_name: String, is_public: bool) -> (String, usize, ServerMsg, bool) {
