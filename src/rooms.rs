@@ -23,7 +23,9 @@ type SessionSender = Arc<UnboundedSender<Message>>;
 
 pub struct RoomManager {
     rooms: Arc<DashMap<String, Room>>,
-    sessions: Arc<DashMap<String, Vec<SessionSender>>>,
+    // (player_id, sender): every connection knows which seat it belongs to,
+    // so state broadcasts can be personalized per viewer (card privacy).
+    sessions: Arc<DashMap<String, Vec<(usize, SessionSender)>>> ,
     code_length: usize,
     bot_turn_delay_ms: u64,
     orphan_timeout_secs: u64,
@@ -42,13 +44,13 @@ impl RoomManager {
         }
     }
 
-    pub fn add_session(&self, code: String, sender: SessionSender) {
-        self.sessions.entry(code).or_insert_with(Vec::new).push(sender);
+    pub fn add_session(&self, code: String, player_id: usize, sender: SessionSender) {
+        self.sessions.entry(code).or_insert_with(Vec::new).push((player_id, sender));
     }
 
     pub fn remove_session(&self, code: &str, sender: &Arc<UnboundedSender<Message>>) {
         if let Some(mut entry) = self.sessions.get_mut(code) {
-            entry.retain(|s| !Arc::ptr_eq(s, sender));
+            entry.retain(|s| !Arc::ptr_eq(&s.1, sender));
         }
         // Drop the entry guard BEFORE touching the map again. Re-locking the
         // shard while holding a get_mut() guard can deadlock when a writer is
@@ -147,7 +149,7 @@ impl RoomManager {
 
             return Ok((ServerMsg::Rejoined {
                 player_id: seat_id,
-                state,
+                state: crate::protocol::personalise_state(&state, seat_id),
                 code: code.clone(),
                 token: token.to_string(),
             }, false));
@@ -348,6 +350,19 @@ impl RoomManager {
     }
 
     pub fn broadcast(&self, code: &str, msg: ServerMsg) {
+        // State-carrying messages are personalized per viewer (card privacy):
+        // every connection only receives the hands / 3s of its own seat.
+        if matches!(msg, ServerMsg::State { .. }) {
+            if let Some(entry) = self.sessions.get(code) {
+                let senders: Vec<_> = entry.iter().map(|e| (e.0, e.1.clone())).collect();
+                for (pid, sender) in senders {
+                    let json = crate::protocol::personalise_for_viewer(&msg, pid);
+                    let _ = sender.send(Message::Text(json.into()));
+                }
+            }
+            return;
+        }
+
         let json = match serde_json::to_string(&msg) {
             Ok(j) => j,
             Err(e) => {
@@ -358,7 +373,7 @@ impl RoomManager {
 
         if let Some(entry) = self.sessions.get(code) {
             let message = Message::Text(json.into());
-            let senders: Vec<_> = entry.iter().map(|e| e.clone()).collect();
+            let senders: Vec<_> = entry.iter().map(|e| e.1.clone()).collect();
             for sender in senders {
                 let _ = sender.send(message.clone());
             }
@@ -413,7 +428,9 @@ impl RoomManager {
         drop(room);
         self.broadcast(code, ServerMsg::GameStarted);
         self.broadcast(code, ServerMsg::State { state: state.clone() });
-        Ok((ServerMsg::State { state }, should_spawn))
+        Ok((ServerMsg::State {
+            state: crate::protocol::personalise_state(&state, player_id),
+        }, should_spawn))
     }
 
     fn generate_code(&self) -> String {
@@ -467,7 +484,9 @@ impl RoomManager {
             process_three_discard(&mut state, pid);
 
             let log_msg = if count > 0 {
-                format!("{} discarded {} ({} 3s)", player_name, cards.join(" "), count)
+                // Privacy: log must not name the exact 3s, it is broadcast to
+                // every seat. Only the count is public information.
+                format!("{} discarded their 3s ({} 3s)", player_name, count)
             } else {
                 format!("{} has no 3s", player_name)
             };

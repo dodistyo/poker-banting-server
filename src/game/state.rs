@@ -76,6 +76,7 @@ pub struct GameState {
     pub trick: TrickState,
     pub finished_order: Vec<usize>,
     pub scores: Vec<i32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub three_discard: Option<ThreeDiscardState>,
     pub log: Vec<String>,
 }

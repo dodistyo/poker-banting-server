@@ -85,7 +85,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 let session = Arc::new(tx);
                 session_tx = Some(session.clone());
-                rooms.add_session(code.clone(), session);
+                rooms.add_session(code.clone(), pid, session);
 
                 spawn_broadcast_forwarder(ws_tx.clone(), rx);
 
@@ -113,7 +113,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                         let session = Arc::new(tx);
                         session_tx = Some(session.clone());
-                        rooms.add_session(join_code.clone(), session);
+                        rooms.add_session(join_code.clone(), player_id.unwrap_or(0), session);
 
                         spawn_broadcast_forwarder(ws_tx.clone(), rx);
 
@@ -172,7 +172,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                         let session = Arc::new(tx);
                         session_tx = Some(session.clone());
-                        rooms.add_session(rejoin_code.clone(), session);
+                        rooms.add_session(rejoin_code.clone(), player_id.unwrap_or(0), session);
 
                         spawn_broadcast_forwarder(ws_tx.clone(), rx);
                     }
