@@ -359,15 +359,7 @@ impl GameEngine {
     }
 
     fn check_and_end_game(&mut self, events: &mut Vec<GameEvent>) {
-        if self.state.finished_order.len() >= 3 && self.state.phase != GamePhase::GameOver {
-            for i in 0..4 {
-                if !self.state.players[i].finished {
-                    self.state.scores[i] = -15;
-                    self.state.finished_order.push(i);
-                    break;
-                }
-            }
-            self.state.phase = GamePhase::GameOver;
+        if super::rules::finalize_game(&mut self.state) {
             events.push(GameEvent::GameOver {
                 final_scores: self.state.scores.clone(),
                 finished_order: self.state.finished_order.clone(),

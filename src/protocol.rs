@@ -237,6 +237,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: vec![],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -273,6 +275,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: vec![],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -349,6 +353,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: vec![],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -371,6 +377,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: Vec::new(),
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -419,6 +427,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: vec![0; 4],
+            round: 1,
+            total_scores: vec![0; 4],
             three_discard: Some(crate::game::state::ThreeDiscardState {
                 order: vec![0, 1, 2, 3],
                 index: 0,

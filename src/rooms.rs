@@ -419,6 +419,18 @@ impl RoomManager {
         if !room.players.iter().any(|p| p.id == player_id && p.is_creator) {
             return Err("Only the room creator can start the game".to_string());
         }
+        // Only a Lobby can start a fresh game, or a GameOver can continue the
+        // session into the next round. (Also prevents a stray StartGame from
+        // re-dealing mid-round.)
+        if room.state.phase != GamePhase::Lobby && room.state.phase != GamePhase::GameOver {
+            return Err("Game already started".to_string());
+        }
+        if room.state.phase == GamePhase::GameOver {
+            // Continuation: the waiting room auto-readies everyone so the
+            // creator can start the next round without re-toggling Ready.
+            for r in room.ready.iter_mut() { *r = true; }
+            for r in room.state.ready.iter_mut() { *r = true; }
+        }
         if !room.all_human_ready() {
             return Err("Not all players are ready".to_string());
         }
@@ -464,7 +476,12 @@ impl RoomManager {
         };
         let td = match &state.three_discard {
             Some(td) => td.clone(),
-            None => return,
+            // Continuation round: there is no three-discard, the game went
+            // straight to Playing — drive bot turns directly.
+            None => {
+                self.enter_playing(code).await;
+                return;
+            }
         };
 
         self.broadcast(code, ServerMsg::State { state: state.clone() });
@@ -498,17 +515,33 @@ impl RoomManager {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        let mut state = match self.get_state(code) {
+        let state = match self.get_state(code) {
             Some(s) => s,
             None => return,
         };
 
         if state.phase == GamePhase::Playing {
-            state.log.push(format!("Game starts! {} leads first trick.", state.players[state.current_player].name));
-            self.update_state(code, state.clone());
-            self.broadcast(code, ServerMsg::State { state: state.clone() });
-            self.process_bot_turns_delayed(code).await;
+            self.enter_playing(code).await;
         }
+    }
+
+    /// Shared "game is live" entry point: log who leads, broadcast, and hand
+    /// over to the bot-turn driver. Used both after the three-discard phase
+    /// (round 1) and directly for continuation rounds (round 2+).
+    async fn enter_playing(&self, code: &str) {
+        let mut state = match self.get_state(code) {
+            Some(s) if s.phase == GamePhase::Playing => s,
+            _ => return,
+        };
+        let lead = state.players[state.current_player].name.clone();
+        if state.round > 1 {
+            state.log.push(format!("Round {}! {} leads first trick.", state.round, lead));
+        } else {
+            state.log.push(format!("Game starts! {} leads first trick.", lead));
+        }
+        self.update_state(code, state.clone());
+        self.broadcast(code, ServerMsg::State { state: state.clone() });
+        self.process_bot_turns_delayed(code).await;
     }
 
     async fn process_bot_turns_delayed(&self, code: &str) {

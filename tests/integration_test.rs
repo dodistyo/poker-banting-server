@@ -36,6 +36,8 @@ fn empty_state() -> GameState {
         trick: TrickState::new(),
         finished_order: Vec::new(),
         scores: vec![0, 0, 0, 0],
+        round: 1,
+        total_scores: vec![0],
         three_discard: None,
         log: Vec::new(),
     }

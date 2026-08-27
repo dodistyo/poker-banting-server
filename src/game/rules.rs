@@ -80,20 +80,36 @@ pub fn player_finished(state: &GameState, player_id: usize) -> bool {
     state.players[player_id].finished
 }
 
-pub fn end_game(state: &mut GameState) -> bool {
-    if state.finished_order.len() >= 3 {
+/// Finalize the game: score the last remaining player, flip phase to
+/// GameOver, and accumulate this round's `scores` into `total_scores`
+/// (the running session score). Returns true if the game just ended.
+///
+/// Every game-over path (engine play/pass, bot turn loop) MUST go through
+/// this helper so cumulative scoring stays consistent.
+pub fn finalize_game(state: &mut GameState) -> bool {
+    if state.finished_order.len() >= 3 && state.phase != GamePhase::GameOver {
         // Score the last remaining player
         for i in 0..4 {
             if !state.players[i].finished {
                 state.scores[i] = -15;
+                state.finished_order.push(i);
                 break;
             }
+        }
+        state.ensure_total_scores();
+        for i in 0..state.players.len().min(4) {
+            state.total_scores[i] += state.scores[i];
         }
         state.phase = GamePhase::GameOver;
         true
     } else {
         false
     }
+}
+
+/// Kept for backward compatibility with existing callers/tests.
+pub fn end_game(state: &mut GameState) -> bool {
+    finalize_game(state)
 }
 
 pub fn next_player(state: &GameState) -> usize {
@@ -219,16 +235,7 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
     use super::combo;
 
     if state.finished_order.len() >= 3 || state.phase != GamePhase::Playing {
-        if state.finished_order.len() >= 3 {
-            state.phase = GamePhase::GameOver;
-            for i in 0..4 {
-                if !state.players[i].finished {
-                    state.scores[i] = -15;
-                    state.finished_order.push(i);
-                    break;
-                }
-            }
-        }
+        finalize_game(state);
         return false;
     }
 
@@ -293,23 +300,6 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
             if let Some(winner) = check_trick_complete(state) {
                 resolve_trick(state, winner);
                 if end_game(state) {
-                    for i in 0..4 {
-                        if !state.players[i].finished {
-                            state.finished_order.push(i);
-                            break;
-                        }
-                    }
-                    return false;
-                }
-                if state.finished_order.len() >= 3 {
-                    state.phase = GamePhase::GameOver;
-                    for i in 0..4 {
-                        if !state.players[i].finished {
-                            state.scores[i] = -15;
-                            state.finished_order.push(i);
-                            break;
-                        }
-                    }
                     return false;
                 }
                 return state.players[state.current_player].is_bot;
@@ -323,23 +313,6 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
             if let Some(winner) = state.trick.combo_player {
                 resolve_trick(state, winner);
                 if end_game(state) {
-                    for i in 0..4 {
-                        if !state.players[i].finished {
-                            state.finished_order.push(i);
-                            break;
-                        }
-                    }
-                    return false;
-                }
-                if state.finished_order.len() >= 3 {
-                    state.phase = GamePhase::GameOver;
-                    for i in 0..4 {
-                        if !state.players[i].finished {
-                            state.scores[i] = -15;
-                            state.finished_order.push(i);
-                            break;
-                        }
-                    }
                     return false;
                 }
                 return state.players[state.current_player].is_bot;
@@ -348,15 +321,7 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
         }
     }
 
-    if state.finished_order.len() >= 3 {
-        state.phase = GamePhase::GameOver;
-        for i in 0..4 {
-            if !state.players[i].finished {
-                state.scores[i] = -15;
-                state.finished_order.push(i);
-                break;
-            }
-        }
+    if finalize_game(state) {
         return false;
     }
 
@@ -461,6 +426,8 @@ mod tests {
             },
             finished_order: vec![0],
             scores: vec![10, 0, 0, 0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -486,6 +453,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: vec![0, 1, 2],
             scores: vec![10, 5, 0, 0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -509,6 +478,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: vec![0],
             scores: vec![10, 0, 0, 0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -531,6 +502,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: vec![0, 0, 0, 0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -556,6 +529,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: vec![0, 0, 0, 0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -577,6 +552,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: vec![0, 0, 0, 0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -598,6 +575,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: vec![0, 0, 0, 0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -645,6 +624,8 @@ mod tests {
             },
             finished_order: Vec::new(),
             scores: vec![0, 0, 0, 0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -673,6 +654,8 @@ mod tests {
             },
             finished_order: Vec::new(),
             scores: vec![0, 0, 0, 0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -701,6 +684,8 @@ mod tests {
             },
             finished_order: vec![2],
             scores: vec![0, 0, 10, 0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };

@@ -76,9 +76,29 @@ pub struct GameState {
     pub trick: TrickState,
     pub finished_order: Vec<usize>,
     pub scores: Vec<i32>,
+    #[serde(default = "default_round")]
+    pub round: usize,
+    #[serde(default)]
+    pub total_scores: Vec<i32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub three_discard: Option<ThreeDiscardState>,
     pub log: Vec<String>,
+}
+
+fn default_round() -> usize {
+    1
+}
+
+impl GameState {
+    /// Grow `total_scores` to cover every seat. Per-round `scores` and the
+    /// cumulative `total_scores` are separate: `scores` is this round's
+    /// points (10/5/0/-15), `total_scores` accumulates across rounds so the
+    /// session scoreboard "berlanjut" from one game to the next.
+    pub fn ensure_total_scores(&mut self) {
+        while self.total_scores.len() < self.players.len() {
+            self.total_scores.push(0);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +158,8 @@ impl Room {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: vec![0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -235,12 +257,58 @@ impl Room {
     }
 
     pub fn start_game(&mut self) {
+        if self.state.phase == GamePhase::GameOver {
+            self.start_next_round();
+            return;
+        }
         while self.players.len() < 4 {
             let bot_num = self.players.len() + 1;
             self.add_bot(format!("Bot {}", bot_num));
         }
         self.started = true;
         self.deal_and_start_discard();
+    }
+
+    /// Start the next round of a continuing session (the room persists after
+    /// game over — no re-creation needed).
+    ///
+    /// The previous round's `scores` are already baked into `total_scores`
+    /// by `finalize_game`; this only resets per-round state. Round 2+ has
+    /// NO three-discard: cards are dealt straight into `Playing`, and the
+    /// player who finished 1st in the previous round leads the first trick.
+    /// Every seat is force-ready so the creator can start immediately.
+    pub fn start_next_round(&mut self) {
+        let prev_winner = self.state.finished_order.first().copied();
+
+        self.state.round += 1;
+
+        for p in self.state.players.iter_mut() {
+            p.hand.clear();
+            p.finished = false;
+        }
+        for r in self.ready.iter_mut() {
+            *r = true;
+        }
+        for r in self.state.ready.iter_mut() {
+            *r = true;
+        }
+
+        self.state.finished_order.clear();
+        while self.state.scores.len() < self.state.players.len() {
+            self.state.scores.push(0);
+        }
+        for s in self.state.scores.iter_mut() {
+            *s = 0;
+        }
+        self.state.ensure_total_scores();
+        self.state.trick = TrickState::new();
+        self.state.three_discard = None;
+
+        let mut engine = crate::game::engine::GameEngine::new(self.state.clone());
+        engine.deal_cards();
+        engine.state_mut().phase = GamePhase::Playing;
+        engine.state_mut().current_player = prev_winner.unwrap_or(0);
+        self.state = engine.state().clone();
     }
 
     pub fn add_disconnected_player(&mut self, seat_id: usize, token: String) {
@@ -400,6 +468,8 @@ mod tests {
             trick: TrickState::new(),
             finished_order: Vec::new(),
             scores: vec![0],
+            round: 1,
+            total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
         };
@@ -464,6 +534,123 @@ mod tests {
     fn test_room_is_public_default() {
         let room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
         assert!(room.is_public);
+    }
+
+    #[test]
+    fn test_finalize_game_accumulates_total_scores_once() {
+        use crate::game::rules::finalize_game;
+        let mut room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
+        room.start_game(); // round 1, phase ThreeDiscard
+
+        // Simulate a finished round: 0=1st, 1=2nd, 2=3rd, 3=last (loser).
+        room.state.scores = vec![10, 5, 0, -15];
+        room.state.finished_order = vec![0, 1, 2];
+        for p in room.state.players.iter_mut() {
+            p.finished = true;
+        }
+        // Undo the 3 finished flags on player 3 so finalize can score the loser.
+        room.state.players[3].finished = false;
+
+        assert!(finalize_game(&mut room.state));
+        assert_eq!(room.state.phase, GamePhase::GameOver);
+        assert_eq!(room.state.total_scores, vec![10, 5, 0, -15]);
+        assert_eq!(room.state.finished_order, vec![0, 1, 2, 3]);
+
+        // Idempotency: a second call must NOT double-accumulate.
+        assert!(!finalize_game(&mut room.state));
+        assert_eq!(room.state.total_scores, vec![10, 5, 0, -15]);
+    }
+
+    #[test]
+    fn test_start_next_round_continues_session() {
+        let mut room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
+        room.start_game();
+        assert_eq!(room.state.round, 1);
+        assert!(room.state.three_discard.is_some());
+
+        // Finish round 1: player 0 wins, player 3 loses.
+        room.state.scores = vec![10, 5, 0, -15];
+        room.state.finished_order = vec![0, 1, 2, 3];
+        room.state.phase = GamePhase::GameOver;
+        room.state.ensure_total_scores();
+        for i in 0..4 {
+            room.state.total_scores[i] += room.state.scores[i];
+            room.state.players[i].finished = true;
+        }
+
+        // Continue the session (creator presses Start Game again).
+        room.start_game();
+
+        assert_eq!(room.state.round, 2);
+        assert_eq!(room.state.phase, GamePhase::Playing);
+        // No three-discard on round 2+.
+        assert!(room.state.three_discard.is_none());
+        // Fresh hands, all 13 cards.
+        for p in room.state.players.iter() {
+            assert_eq!(p.hand.len(), 13);
+            assert!(!p.finished);
+        }
+        // Per-round scores reset; cumulative scores preserved.
+        assert_eq!(room.state.scores, vec![0, 0, 0, 0]);
+        assert_eq!(room.state.total_scores, vec![10, 5, 0, -15]);
+        // Previous round's winner leads the first trick.
+        assert_eq!(room.state.current_player, 0);
+        assert!(room.state.finished_order.is_empty());
+        // Auto-ready so the waiting room can start immediately.
+        assert!(room.ready.iter().all(|&r| r));
+        assert!(room.state.ready.iter().all(|&r| r));
+    }
+
+    #[test]
+    fn test_start_game_rejected_mid_round() {
+        use crate::rooms::RoomManager;
+        let mgr = RoomManager::new(6, 100, 60, 30);
+        let (code, pid, _msg, _s) = mgr.create_room("Host".to_string(), true);
+        // Start the round 1 (phase ThreeDiscard).
+        let (msg, _spawn) = mgr.start_game(&code, pid).unwrap();
+        assert!(matches!(msg, crate::protocol::ServerMsg::State { .. }));
+        // A stray StartGame mid-round must be rejected, not re-deal.
+        let result = mgr.start_game(&code, pid);
+        assert!(result.is_err(), "mid-round StartGame must be rejected");
+    }
+
+    #[test]
+    fn test_start_game_from_gameover_continues() {
+        use crate::rooms::RoomManager;
+        let mgr = RoomManager::new(6, 100, 60, 30);
+        let (code, pid, _msg, _s) = mgr.create_room("Host".to_string(), true);
+        let (_, _spawn) = mgr.start_game(&code, pid).unwrap();
+
+        // Finish round 1 so the room sits in GameOver.
+        {
+            let map = mgr.rooms_ref();
+            let mut entry = map.get_mut(&code).unwrap();
+            let room: &mut Room = &mut *entry;
+            room.state.scores = vec![10, 5, 0, -15];
+            room.state.finished_order = vec![0, 1, 2, 3];
+            room.state.phase = GamePhase::GameOver;
+            room.state.ensure_total_scores();
+            for i in 0..4 {
+                room.state.total_scores[i] += room.state.scores[i];
+                room.state.players[i].finished = true;
+            }
+        }
+
+        // Creator starts again: round 2, no 3-discard, cumulative scores kept.
+        let (msg, spawn) = mgr.start_game(&code, pid).unwrap();
+        assert!(spawn, "continuation must drive bot turns");
+        match msg {
+            crate::protocol::ServerMsg::State { state } => {
+                assert_eq!(state.round, 2);
+                assert_eq!(state.phase, GamePhase::Playing);
+                assert!(state.three_discard.is_none());
+                assert_eq!(state.total_scores, vec![10, 5, 0, -15]);
+                assert_eq!(state.scores, vec![0, 0, 0, 0]);
+                assert_eq!(state.current_player, 0);
+                assert!(state.ready.iter().all(|&r| r));
+            }
+            other => panic!("expected State, got {:?}", other),
+        }
     }
 
     #[test]
