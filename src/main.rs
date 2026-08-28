@@ -39,7 +39,11 @@ async fn main() -> std::io::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/ws", get(ws::ws_index))
-        .route("/api/rooms", get(list_rooms))
+        // NOTE: no /api prefix here — the client's dev proxy (dev-server.js)
+        // strips the /api prefix before forwarding, so routes must be
+        // prefix-free like /ws and /health. (This was why "Browse Public
+        // Rooms" always came back empty: /api/rooms -> /rooms -> 404.)
+        .route("/rooms", get(list_rooms))
         .with_state(rooms);
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
