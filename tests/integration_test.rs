@@ -1,10 +1,10 @@
-use pocer_server::game::card::{Card, Rank, Suit};
-use pocer_server::game::combo::{self, ComboType};
-use pocer_server::game::rules::*;
-use pocer_server::game::state::*;
-use pocer_server::game::bot::bot_play;
-use pocer_server::protocol::{ClientMsg, ServerMsg};
-use pocer_server::rooms::RoomManager;
+use poker_banting_server::game::card::{Card, Rank, Suit};
+use poker_banting_server::game::combo::{self, ComboType};
+use poker_banting_server::game::rules::*;
+use poker_banting_server::game::state::*;
+use poker_banting_server::game::bot::bot_play;
+use poker_banting_server::protocol::{ClientMsg, ServerMsg};
+use poker_banting_server::rooms::RoomManager;
 
 fn card(rank: Rank, suit: Suit) -> Card {
     Card::new(rank, suit)
