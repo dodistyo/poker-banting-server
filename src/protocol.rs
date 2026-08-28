@@ -139,6 +139,11 @@ fn personalise_state_value(v: &mut serde_json::Value, viewer: usize) {
         }
     }
     if let Some(td) = v.get_mut("threeDiscard") {
+        // Other players' 3s are intentionally PUBLIC here: they are removed
+        // from all hands at the start of the phase and never re-enter play,
+        // so revealing them leaks nothing. Showing them lets players verify
+        // the (public) discard order. playerCounts stays for the "no 3s"
+        // fallback label.
         let counts: Vec<usize> = td
             .get("playerCards")
             .and_then(|x| x.as_array())
@@ -148,13 +153,6 @@ fn personalise_state_value(v: &mut serde_json::Value, viewer: usize) {
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(pc) = td.get_mut("playerCards").and_then(|x| x.as_array_mut()) {
-            for (i, c) in pc.iter_mut().enumerate() {
-                if i != viewer {
-                    *c = serde_json::Value::Array(Vec::new());
-                }
-            }
-        }
         td["playerCounts"] = serde_json::Value::from(counts);
     }
 }
@@ -407,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn test_personalise_msg_hides_other_threes() {
+    fn test_personalise_msg_shows_other_threes() {
         use crate::game::card::{Card, Rank, Suit};
         let state = GameState {
             phase: GamePhase::ThreeDiscard,
@@ -445,17 +443,20 @@ mod tests {
         let json = personalise_for_viewer(&ServerMsg::State { state }, 0);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let td = &v["state"]["threeDiscard"];
-        // Viewer keeps their own 3s
+        // 3s are public during the discard phase: they are removed from all
+        // hands up front and never re-enter play, so the viewer sees EVERYONE's.
         assert_eq!(td["playerCards"][0].as_array().unwrap().len(), 2);
-        // Others are masked
-        assert!(td["playerCards"][1].as_array().unwrap().is_empty());
-        assert!(td["playerCards"][2].as_array().unwrap().is_empty());
-        assert!(td["playerCards"][3].as_array().unwrap().is_empty());
+        assert_eq!(td["playerCards"][1].as_array().unwrap().len(), 1);
+        assert_eq!(td["playerCards"][2].as_array().unwrap().len(), 0);
+        assert_eq!(td["playerCards"][3].as_array().unwrap().len(), 1);
         // Counts stay public
         assert_eq!(td["playerCounts"][0].as_u64(), Some(2));
         assert_eq!(td["playerCounts"][1].as_u64(), Some(1));
         assert_eq!(td["playerCounts"][2].as_u64(), Some(0));
         assert_eq!(td["playerCounts"][3].as_u64(), Some(1));
+        // But other players' regular hands are still private
+        assert!(v["state"]["players"][1]["hand"].as_array().unwrap().is_empty());
+        assert_eq!(v["state"]["players"][1]["handCount"].as_u64(), Some(0));
     }
 
     #[test]
