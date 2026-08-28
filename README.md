@@ -1,6 +1,6 @@
 # Pocer Server
 
-Real-time card game server for Pocer (Capsa Banting). WebSocket-based multiplayer with room management, bot support, and combo detection.
+Real-time card game server for Pocer (Poker Banting). WebSocket-based multiplayer with room management, bot support, and combo detection.
 
 ## Tech Stack
 
