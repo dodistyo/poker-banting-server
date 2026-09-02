@@ -320,7 +320,44 @@ impl RoomManager {
             });
         }
 
-        None
+        // Mid-game explicit leave (the client's Leave button in the menu
+        // drawer): convert the seat to a bot so the game continues for the
+        // remaining humans. Mirrors leave_room's socket-drop mid-game branch
+        // — the two paths must stay in sync or a deliberate leave silently
+        // strands the round (this used to return None here: no bot, no
+        // broadcast, everyone stuck on the leaver's turn).
+        if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
+            player.name = format!("Bot ({})", player_name);
+            player.is_bot = true;
+            player.connected = true;
+            player.disconnect_time = None;
+            player.token = None;
+        }
+        if let Some(player) = room.state.players.iter_mut().find(|p| p.id == player_id) {
+            player.name = format!("Bot ({})", player_name);
+            player.is_bot = true;
+            player.connected = true;
+        }
+
+        let state = room.state.clone();
+        room.record_human_disconnect();
+        let orphaned = room.is_orphaned(self.orphan_timeout_secs);
+        drop(room);
+
+        if orphaned {
+            self.rooms.remove(code);
+            self.sessions.remove(code);
+        } else {
+            self.broadcast(&code, ServerMsg::PlayerLeft {
+                player_id,
+                name: player_name.clone(),
+            });
+            self.broadcast(&code, ServerMsg::State { state });
+        }
+        Some(ServerMsg::PlayerLeft {
+            player_id,
+            name: player_name,
+        })
     }
 
     pub fn get_room(&self, code: &str) -> Option<Room> {
@@ -1060,5 +1097,32 @@ mod tests {
         let bot_id = room.players.iter().position(|p| p.is_bot).unwrap();
 
         assert!(manager.remove_player(&code, bot_id).is_none());
+    }
+
+    #[test]
+    fn test_remove_player_mid_game_becomes_bot() {
+        // The menu drawer's Leave button sends an explicit LeaveRoom ->
+        // remove_player. Mid-game that must convert the seat to a bot so the
+        // round continues (regression: this used to return None, stranding
+        // everyone on the leaver's turn).
+        let manager = RoomManager::new(6, 2500, 30, 15);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
+
+        let result = manager.remove_player(&code, 1);
+        assert!(result.is_some());
+
+        let room = manager.get_room(&code).unwrap();
+        assert_eq!(room.players.len(), 4);
+        let leaver = room.players.iter().find(|p| p.id == 1).unwrap();
+        assert!(leaver.is_bot);
+        assert_eq!(leaver.name, "Bot (Bob)");
+        assert!(leaver.connected);
+        let state_leaver = room.state.players.iter().find(|p| p.id == 1).unwrap();
+        assert!(state_leaver.is_bot);
+        assert_eq!(state_leaver.name, "Bot (Bob)");
     }
 }
