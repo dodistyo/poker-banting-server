@@ -157,19 +157,6 @@ fn personalise_state_value(v: &mut serde_json::Value, viewer: usize) {
     }
 }
 
-/// Return a copy of `state` as seen by `viewer` (card privacy):
-/// other players' hands are emptied (public `handCount` is added) and
-/// other players' 3s are emptied (public `threeDiscard.playerCounts` is
-/// added). Used for direct sends (created/joined/rejoined/start_game)
-/// where the message goes to a single client, not through broadcast.
-pub fn personalise_state(state: &GameState, viewer: usize) -> GameState {
-    let mut v = serde_json::to_value(state)
-        .unwrap_or_else(|e| panic!("Failed to serialize state: {}", e));
-    personalise_state_value(&mut v, viewer);
-    serde_json::from_value(v)
-        .unwrap_or_else(|e| panic!("Failed to deserialize personalized state: {}", e))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,43 +352,61 @@ mod tests {
     }
 
     #[test]
-    fn test_personalise_state_hides_other_hands() {
+    fn test_rejoined_wire_keeps_hand_count() {
+        // Regression: opponents must arrive with BOTH handCount set AND a
+        // masked (empty) hand on the rejoin wire. The old personalise_state()
+        // round-tripped the result back through the GameState struct, which
+        // has no handCount field, so the count was silently dropped and the
+        // client fell back to hand.length == 0 -> "bots show 0 cards" after
+        // a page refresh.
         use crate::game::card::{Card, Rank, Suit};
-        let mut state = GameState {
+        let state = GameState {
             phase: GamePhase::Playing,
-            players: vec![],
-            ready: vec![],
+            players: (0..4)
+                .map(|i| Player {
+                    id: i,
+                    name: format!("P{}", i),
+                    hand: vec![
+                        Card::new(Rank::King, Suit::Hearts),
+                        Card::new(Rank::Three, Suit::Spades),
+                        Card::new(Rank::Five, Suit::Clubs),
+                    ],
+                    finished: false,
+                    is_bot: i != 0,
+                    connected: true,
+                    is_creator: i == 0,
+                })
+                .collect(),
+            ready: vec![true; 4],
             current_player: 0,
             trick: TrickState::new(),
             finished_order: Vec::new(),
-            scores: Vec::new(),
+            scores: vec![0; 4],
             round: 1,
-            total_scores: vec![0],
+            total_scores: vec![0; 4],
             three_discard: None,
             log: Vec::new(),
         };
-        for i in 0..4 {
-            let mut p = Player {
-                id: i,
-                name: format!("P{}", i),
-                hand: vec![
-                    Card::new(Rank::King, Suit::Hearts),
-                    Card::new(Rank::Three, Suit::Spades),
-                ],
-                finished: false,
-                is_bot: i != 0,
-                connected: true,
-                is_creator: i == 0,
-            };
-            state.players.push(p);
+        let msg = ServerMsg::Rejoined {
+            player_id: 0,
+            state,
+            code: "ABC123".to_string(),
+            token: "abc123".to_string(),
+        };
+        let json = personalise_for_viewer(&msg, 0);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let players = &v["state"]["players"];
+        // Viewer keeps the real hand.
+        assert_eq!(players[0]["hand"].as_array().unwrap().len(), 3);
+        for i in [1usize, 2, 3] {
+            let p = &players[i];
+            // Opponent hands are masked...
+            assert!(p["hand"].as_array().unwrap().is_empty(),
+                "player {} hand not masked", i);
+            // ...but the count MUST survive on the wire.
+            assert_eq!(p["handCount"].as_u64(), Some(3),
+                "player {} handCount dropped on rejoin wire", i);
         }
-        let view = personalise_state(&state, 1);
-        // Own hand survives, count is public
-        assert_eq!(view.players[1].hand.len(), 2);
-        // Other hands are empty
-        assert!(view.players[0].hand.is_empty());
-        assert!(view.players[2].hand.is_empty());
-        assert!(view.players[3].hand.is_empty());
     }
 
     #[test]

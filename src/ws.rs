@@ -79,7 +79,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 player_id = Some(pid);
 
                 let _ = ws_tx.send(Message::Text(
-                    serde_json::to_string(&server_msg).unwrap().into(),
+                    crate::protocol::personalise_for_viewer(&server_msg, pid).into(),
                 ));
 
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -107,7 +107,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                             player_id = Some(*pid);
                         }
                         let _ = ws_tx.send(Message::Text(
-                            serde_json::to_string(&server_msg).unwrap().into(),
+                            crate::protocol::personalise_for_viewer(&server_msg, player_id.unwrap_or(0)).into(),
                         ));
 
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -166,7 +166,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                             player_id = Some(*pid);
                         }
                         let _ = ws_tx.send(Message::Text(
-                            serde_json::to_string(&server_msg).unwrap().into(),
+                            crate::protocol::personalise_for_viewer(&server_msg, player_id.unwrap_or(0)).into(),
                         ));
 
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -216,7 +216,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 match rooms.start_game(&code, pid) {
                     Ok((server_msg, should_spawn)) => {
                         let _ = ws_tx.send(Message::Text(
-                            serde_json::to_string(&server_msg).unwrap().into(),
+                            crate::protocol::personalise_for_viewer(&server_msg, pid).into(),
                         ));
                         if should_spawn {
                             let rooms_clone = rooms.clone();

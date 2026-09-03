@@ -149,7 +149,12 @@ impl RoomManager {
 
             return Ok((ServerMsg::Rejoined {
                 player_id: seat_id,
-                state: crate::protocol::personalise_state(&state, seat_id),
+                // Raw (un-masked) state on purpose: the caller serializes it
+                // through personalise_for_viewer, which adds the public
+                // handCount AND masks other hands in one JSON pass. Doing the
+                // masking here on the GameState struct used to drop handCount
+                // (the struct has no such field) -> opponents showed 0 cards.
+                state,
                 code: code.clone(),
                 token: token.to_string(),
             }, false));
@@ -477,9 +482,14 @@ impl RoomManager {
         drop(room);
         self.broadcast(code, ServerMsg::GameStarted);
         self.broadcast(code, ServerMsg::State { state: state.clone() });
-        Ok((ServerMsg::State {
-            state: crate::protocol::personalise_state(&state, player_id),
-        }, should_spawn))
+        Ok((
+            ServerMsg::State {
+                // Raw state: ws.rs serializes this via personalise_for_viewer
+                // (one JSON pass -> handCount kept, other hands masked).
+                state,
+            },
+            should_spawn,
+        ))
     }
 
     fn generate_code(&self) -> String {
