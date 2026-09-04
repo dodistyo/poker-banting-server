@@ -133,6 +133,7 @@ impl RoomManager {
 
         room.cleanup_expired_disconnected(Self::REJOIN_TIMEOUT_SECS);
 
+        let mut seat_in_use = false;
         if let Some(pos) = room.disconnected_players.iter().position(|(_, t, _)| t == token) {
             let (seat_id, _, _) = room.disconnected_players.remove(pos);
 
@@ -160,7 +161,23 @@ impl RoomManager {
             }, false));
         }
 
-        Err("No matching disconnected player found".to_string())
+        // Not a disconnected seat. Distinguish "another live connection is
+        // sitting in this seat" (same token still in `players` as connected
+        // — e.g. the user opened a second tab / PWA + mobile browser) from a
+        // genuinely gone seat (expired / room closed). The client shows a
+        // "close your other window" hint in the first case and must NOT drop
+        // the session: the room is alive, the seat is just busy right now.
+        seat_in_use = room
+            .players
+            .iter()
+            .any(|p| p.token.as_deref() == Some(token) && p.connected);
+        drop(room);
+
+        Err(if seat_in_use {
+            "Seat already in use by another window".to_string()
+        } else {
+            "No matching disconnected player found".to_string()
+        })
     }
 
     pub fn leave_room(&self, code: &str, player_id: usize) -> Option<ServerMsg> {
@@ -877,6 +894,27 @@ mod tests {
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         let result = manager.rejoin_room(&code, "Unknown", "nonexistent-token");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rejoin_seat_still_connected_reports_in_use() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        let (joined_msg, _) = manager.join_room(&code, "Bob".to_string()).unwrap();
+        let token = match &joined_msg {
+            ServerMsg::Joined { token, .. } => token.clone(),
+            _ => panic!("Expected Joined"),
+        };
+        // Bob's seat is still CONNECTED (he never left) — a second window
+        // holding the same token must get the "in use" error, not the
+        // generic "gone" one. The client uses that string to keep the
+        // session alive and hint "close your other window".
+        let err = manager.rejoin_room(&code, "Bob", &token).unwrap_err();
+        assert!(err.contains("in use"), "expected in-use error, got: {err}");
+        // The seat must be untouched: still connected, token intact.
+        let room = manager.get_room(&code).unwrap();
+        let seat = room.players.iter().find(|p| p.token.as_deref() == Some(&token)).unwrap();
+        assert!(seat.connected);
     }
 
     // --- check_room (read-only rejoin probe) --------------------------------

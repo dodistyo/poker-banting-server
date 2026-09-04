@@ -176,11 +176,15 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
 
                         spawn_broadcast_forwarder(ws_tx.clone(), rx);
                     }
-            Err(_) => {
-
+            Err(err) => {
+                        // Forward the specific reason: "Seat already in use by
+                        // another window" (second tab holds the seat) needs a
+                        // different client reaction than a genuinely gone
+                        // seat. The client matches the in-use string; any
+                        // other message keeps the old retry-then-clear path.
                         let _ = ws_tx.send(Message::Text(
                             serde_json::to_string(&ServerMsg::Error {
-                                message: "Rejoin failed. Please create or join a new room.".to_string(),
+                                message: err,
                             }).unwrap().into(),
                         ));
                     }
