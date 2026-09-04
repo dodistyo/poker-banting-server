@@ -246,6 +246,18 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 cleaned_up = true;
                 break;
             }
+            ClientMsg::CheckRoom { code, token } => {
+                // Read-only: no seat is touched, so the user can still click
+                // the (still visible) Rejoin item right afterwards.
+                let (found, rejoinable) = rooms.check_room(&code, &token);
+                let _ = ws_tx.send(Message::Text(
+                    serde_json::to_string(&ServerMsg::RoomStatus {
+                        code: code.to_uppercase(),
+                        found,
+                        rejoinable,
+                    }).unwrap().into(),
+                ));
+            }
             ClientMsg::Ping => {
                 let _ = ws_tx.send(Message::Text(
                     serde_json::to_string(&ServerMsg::Pong).unwrap().into(),

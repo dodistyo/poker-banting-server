@@ -25,6 +25,14 @@ pub enum ClientMsg {
         name: String,
         token: String,
     },
+    /// Read-only probe: "does this room exist and is this token's seat still
+    /// claimable?" Used by the client on connect to decide whether the saved
+    /// session's "Rejoin" menu item is still truthful.
+    #[serde(rename = "checkRoom")]
+    CheckRoom {
+        code: String,
+        token: String,
+    },
     #[serde(rename = "play")]
     Play {
         cards: Vec<String>,
@@ -69,6 +77,15 @@ pub enum ServerMsg {
         state: GameState,
         code: String,
         token: String,
+    },
+    /// Answer to a CheckRoom probe. `found` = the room still exists on the
+    /// server; `rejoinable` = this token's seat is waiting in
+    /// disconnected_players (i.e. rejoin_room would succeed right now).
+    #[serde(rename = "roomStatus")]
+    RoomStatus {
+        code: String,
+        found: bool,
+        rejoinable: bool,
     },
     #[serde(rename = "state")]
     State {
@@ -326,6 +343,33 @@ mod tests {
             }
             _ => panic!("Expected Rejoin"),
         }
+    }
+
+    #[test]
+    fn test_client_msg_check_room() {
+        let json = r#"{"type":"checkRoom","code":"ABC123","token":"abc123"}"#;
+        let msg: ClientMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ClientMsg::CheckRoom { code, token } => {
+                assert_eq!(code, "ABC123");
+                assert_eq!(token, "abc123");
+            }
+            _ => panic!("Expected CheckRoom"),
+        }
+    }
+
+    #[test]
+    fn test_server_msg_room_status() {
+        let msg = ServerMsg::RoomStatus {
+            code: "ABC123".to_string(),
+            found: true,
+            rejoinable: false,
+        };
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(v["type"].as_str(), Some("roomStatus"));
+        assert_eq!(v["code"].as_str(), Some("ABC123"));
+        assert_eq!(v["found"].as_bool(), Some(true));
+        assert_eq!(v["rejoinable"].as_bool(), Some(false));
     }
 
     #[test]

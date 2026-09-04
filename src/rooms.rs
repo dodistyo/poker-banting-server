@@ -365,6 +365,24 @@ impl RoomManager {
         })
     }
 
+    /// Read-only rejoin probe (the client's "is my saved session still
+    /// live?" check on connect). Runs the same expiry cleanup as rejoin
+    /// so the answer matches what a real rejoin would do right now, but
+    /// never mutates seats: the room is left exactly as found.
+    /// Returns (found, rejoinable).
+    pub fn check_room(&self, code: &str, token: &str) -> (bool, bool) {
+        let code = code.to_uppercase();
+        let Some(mut room) = self.rooms.get_mut(&code) else {
+            return (false, false);
+        };
+        room.cleanup_expired_disconnected(Self::REJOIN_TIMEOUT_SECS);
+        let rejoinable = room
+            .disconnected_players
+            .iter()
+            .any(|(_, t, _)| t == token);
+        (true, rejoinable)
+    }
+
     pub fn get_room(&self, code: &str) -> Option<Room> {
         self.rooms.get(code).map(|r| r.value().clone())
     }
@@ -859,6 +877,96 @@ mod tests {
         let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
         let result = manager.rejoin_room(&code, "Unknown", "nonexistent-token");
         assert!(result.is_err());
+    }
+
+    // --- check_room (read-only rejoin probe) --------------------------------
+
+    #[test]
+    fn test_check_room_not_found() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+        let (found, rejoinable) = manager.check_room("NOPE12", "token");
+        assert!(!found);
+        assert!(!rejoinable);
+    }
+
+    #[test]
+    fn test_check_room_found_not_rejoinable() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        // Room exists, but nobody is disconnected -> found=true, rejoinable=false.
+        let (found, rejoinable) = manager.check_room(&code, "wrong-token");
+        assert!(found);
+        assert!(!rejoinable);
+    }
+
+    #[test]
+    fn test_check_room_found_and_rejoinable() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        let (joined_msg, _) = manager.join_room(&code, "Bob".to_string()).unwrap();
+        let token = match &joined_msg {
+            ServerMsg::Joined { token, .. } => token.clone(),
+            _ => panic!("Expected Joined"),
+        };
+
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
+        manager.leave_room(&code, 1);
+
+        let (found, rejoinable) = manager.check_room(&code, &token);
+        assert!(found);
+        assert!(rejoinable);
+
+        // READ-ONLY: the probe must NOT have claimed the seat. A real rejoin
+        // right after the probe still succeeds.
+        let room = manager.get_room(&code).unwrap();
+        assert!(room.disconnected_players.iter().any(|(_, t, _)| t == &token));
+    }
+
+    #[test]
+    fn test_check_room_case_insensitive_code() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        let lower = code.to_lowercase();
+        let (found, _) = manager.check_room(&lower, "x");
+        assert!(found);
+    }
+
+    #[test]
+    fn test_check_room_expires_stale_seat() {
+        let manager = RoomManager::new(6, 2500, 30, 15);
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        let (joined_msg, _) = manager.join_room(&code, "Bob".to_string()).unwrap();
+        let token = match &joined_msg {
+            ServerMsg::Joined { token, .. } => token.clone(),
+            _ => panic!("Expected Joined"),
+        };
+
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
+        manager.leave_room(&code, 1);
+
+        // Expire the disconnected entry in-place so the probe's cleanup
+        // removes it, matching what a real rejoin would see.
+        manager.expire_disconnected_player(&code, &token);
+
+        let (found, rejoinable) = manager.check_room(&code, &token);
+        assert!(found);
+        assert!(!rejoinable);
+    }
+
+    #[test]
+    fn test_check_room_after_room_removed() {
+        let manager = RoomManager::new(6, 2500, 0, 0);
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        // Orphaned on creator leave (timeout 0) -> room removed.
+        manager.leave_room(&code, 0);
+        assert_eq!(manager.room_count(), 0);
+
+        let (found, rejoinable) = manager.check_room(&code, "token");
+        assert!(!found);
+        assert!(!rejoinable);
     }
 
     #[test]
