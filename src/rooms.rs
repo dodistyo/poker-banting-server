@@ -461,6 +461,26 @@ impl RoomManager {
         self.rooms.len()
     }
 
+    /// Periodic reaper. `is_orphaned()` is otherwise only consulted *at* a
+    /// human's disconnect, when the disconnect timer is 0s old, so it never
+    /// fires there — a room whose last human left was silently kept forever
+    /// (memory leak, phantom "Browse Public Rooms" entries). This is called
+    /// from a background tick: drop every room with no connected human whose
+    /// last-disconnect timer has matured, plus any dangling session senders.
+    pub fn reap_orphaned_rooms(&self) -> usize {
+        let orphans: Vec<String> = self
+            .rooms
+            .iter()
+            .filter(|e| e.value().is_orphaned(self.orphan_timeout_secs))
+            .map(|e| e.key().clone())
+            .collect();
+        for code in &orphans {
+            self.rooms.remove(code);
+            self.sessions.remove(code);
+        }
+        orphans.len()
+    }
+
     pub fn list_public_rooms(&self) -> Vec<PublicRoomSummary> {
         let mut result = Vec::new();
         for entry in self.rooms.iter() {
@@ -1140,6 +1160,52 @@ mod tests {
 
         manager.leave_room(&code, 0);
         assert_eq!(manager.room_count(), 1);
+    }
+
+    #[test]
+    fn test_reaper_drops_orphaned_rooms() {
+        // Short orphan timeout so the room is already "mature" by the time the
+        // reaper runs. Two humans leave a private game: the seat becomes a
+        // bot, last_human_disconnect_at is set, and no human stays connected.
+        let manager = RoomManager::new(6, 2500, 1, 15);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), false);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
+
+        manager.leave_room(&code, 1); // Bob -> bot, Alice still connected
+        assert_eq!(manager.room_count(), 1);
+        manager.leave_room(&code, 0); // Alice -> bot, room now orphaned
+
+        // Not removed *at* the disconnect (timer is 0s old) — that's the bug
+        // the reaper exists to fix.
+        assert_eq!(manager.room_count(), 1);
+
+        // Let the orphan timer mature (timeout = 1s).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let dropped = manager.reap_orphaned_rooms();
+        assert_eq!(dropped, 1);
+        assert_eq!(manager.room_count(), 0);
+        assert_eq!(manager.get_state(&code), None);
+    }
+
+    #[test]
+    fn test_reaper_keeps_room_with_connected_human() {
+        // One human still connected -> not orphaned, reaper must not touch it.
+        let manager = RoomManager::new(6, 2500, 1, 15);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), false);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.ready_player(&code, 1, true).unwrap();
+        manager.start_game(&code, 0).unwrap();
+
+        manager.leave_room(&code, 1); // Bob -> bot, Alice still connected
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let dropped = manager.reap_orphaned_rooms();
+        assert_eq!(dropped, 0);
+        assert_eq!(manager.room_count(), 1);
+        assert!(manager.get_state(&code).is_some());
     }
 
     #[test]
