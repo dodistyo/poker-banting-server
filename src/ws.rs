@@ -198,9 +198,10 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 let pid = player_id.unwrap();
                 match rooms.ready_player(&code, pid, ready) {
                     Ok(server_msg) => {
-                        let _ = ws_tx.send(Message::Text(
-                            serde_json::to_string(&server_msg).unwrap().into(),
-                        ));
+                        // Broadcast to the WHOLE room, not just the toggle
+                        // sender — otherwise the room creator (and everyone
+                        // else) never sees the status flip.
+                        rooms.broadcast(&code, server_msg);
                     }
                     Err(err) => {
                         let _ = ws_tx.send(Message::Text(
