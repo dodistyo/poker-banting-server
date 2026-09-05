@@ -370,25 +370,115 @@ impl Room {
         }
     }
 
-    pub fn cleanup_disconnected_lobby_players(&mut self, timeout_secs: u64) -> Vec<(usize, String)> {
+    /// Move the creator crown from the leaving seat to the next connected
+    /// human, in BOTH parallel vectors (the client renders state.players),
+    /// and auto-ready the new creator (the Ready button is hidden for the
+    /// creator, so a non-ready creator could never satisfy all_human_ready()
+    /// and the room would be stuck). Lobby only.
+    pub fn transfer_crown_from(&mut self, leaving_id: usize) {
+        if self.state.phase != GamePhase::Lobby {
+            return;
+        }
+        if let Some(new_creator) = self
+            .players
+            .iter()
+            .position(|p| !p.is_bot && p.connected && p.id != leaving_id)
+        {
+            let target_id = self.players[new_creator].id;
+            self.players[new_creator].is_creator = true;
+            if let Some(sp) = self.state.players.iter_mut().find(|p| p.id == target_id) {
+                sp.is_creator = true;
+            }
+            if target_id < self.ready.len() {
+                self.ready[target_id] = true;
+            }
+            if target_id < self.state.ready.len() {
+                self.state.ready[target_id] = true;
+            }
+        }
+    }
+
+    /// Compact a seat out of EVERY lobby parallel vector and renumber the
+    /// survivors to dense 0..n-1, so `players[i].id == i` stays true for BOTH
+    /// `players` and `state.players`, and `ready` / `state.ready` / `scores`
+    /// stay aligned with the seats. Lobby only — mid-game seats never leave
+    /// (they become bots instead).
+    ///
+    /// Also drops the removed seat's pending rejoin token and shifts down any
+    /// other pending disconnect entries: without that, a late Rejoin from a
+    /// reaped seat would restore_seat() onto a compacted slot that now
+    /// belongs to someone else (seat hijack).
+    ///
+    /// Returns the old→new seat map so callers can follow the survivors' ids
+    /// into their session records — otherwise a survivor's stale player_id
+    /// would point at someone else's hand/personalization and their plays
+    /// would be rejected.
+    pub fn remove_lobby_seat(&mut self, seat_id: usize) -> Vec<(usize, usize)> {
         if self.state.phase != GamePhase::Lobby {
             return Vec::new();
+        }
+        let mut renumbered: Vec<(usize, usize)> = Vec::new();
+        self.players.retain(|p| p.id != seat_id);
+        self.state.players.retain(|p| p.id != seat_id);
+        if seat_id < self.ready.len() {
+            self.ready.remove(seat_id);
+        }
+        // The leaver's ready bit is moot once they're gone — but the bit is
+        // only removed in the lobby (mid-game seats become bots), so set the
+        // survivor-side invariant cheaply: a seat that no longer exists
+        // can't block all_human_ready().
+        if seat_id < self.state.ready.len() {
+            self.state.ready.remove(seat_id);
+        }
+        if seat_id < self.state.scores.len() {
+            self.state.scores.remove(seat_id);
+        }
+        for (new_id, p) in self.players.iter_mut().enumerate() {
+            if p.id != new_id {
+                renumbered.push((p.id, new_id));
+            }
+            p.id = new_id;
+        }
+        for (new_id, p) in self.state.players.iter_mut().enumerate() {
+            p.id = new_id;
+        }
+        self
+            .disconnected_players
+            .retain(|(id, _, _)| *id != seat_id);
+        for (id, _, _) in self.disconnected_players.iter_mut() {
+            if *id > seat_id {
+                *id -= 1;
+            }
+        }
+        renumbered
+    }
+
+    pub fn cleanup_disconnected_lobby_players(&mut self, timeout_secs: u64) -> (Vec<(usize, String)>, Vec<(usize, usize)>) {
+        if self.state.phase != GamePhase::Lobby {
+            return (Vec::new(), Vec::new());
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let mut removed = Vec::new();
-        self.players.retain(|p| {
-            if let Some(dt) = p.disconnect_time {
-                if now - dt >= timeout_secs {
-                    removed.push((p.id, p.name.clone()));
-                    return false;
-                }
-            }
-            true
-        });
-        removed
+        // Collect the stale seats first (dense invariant: position == id).
+        // Removing them via remove_lobby_seat() shifts later ids down by one
+        // each, so walk ascending and subtract how many were already removed.
+        // Every survivor renumber is recorded (old -> new) so the manager can
+        // follow ids into the session map.
+        let stale: Vec<(usize, String)> = self
+            .players
+            .iter()
+            .filter(|p| p.disconnect_time.map_or(false, |dt| now - dt >= timeout_secs))
+            .map(|p| (p.id, p.name.clone()))
+            .collect();
+        let mut removed = 0usize;
+        let mut renumbered: Vec<(usize, usize)> = Vec::new();
+        for (old_id, _) in stale.iter() {
+            renumbered.extend(self.remove_lobby_seat(old_id - removed));
+            removed += 1;
+        }
+        (stale, renumbered)
     }
 }
 

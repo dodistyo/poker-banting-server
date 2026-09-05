@@ -78,6 +78,15 @@ pub enum ServerMsg {
         code: String,
         token: String,
     },
+    /// A lobby compaction renumbered surviving seats. `renumbered` maps
+    /// old_seat -> new_seat for every survivor whose id changed (a client
+    /// without an entry in the list keeps its id). The client must follow
+    /// its stored player_id to the new value so Ready/Play/personalisation
+    /// keep targeting its own seat.
+    #[serde(rename = "seatChanged")]
+    SeatChanged {
+        renumbered: Vec<(usize, usize)>,
+    },
     /// Answer to a CheckRoom probe. `found` = the room still exists on the
     /// server; `rejoinable` = this token's seat is waiting in
     /// disconnected_players (i.e. rejoin_room would succeed right now).

@@ -212,15 +212,13 @@ impl RoomManager {
                         .as_secs());
                 }
                 if is_creator {
-                    if let Some(new_creator) = room.players.iter().position(|p| !p.is_bot && p.connected && p.id != player_id) {
-                        room.players[new_creator].is_creator = true;
-                    }
+                    room.transfer_crown_from(player_id);
                 }
                 let msg = ServerMsg::PlayerLeft {
                     player_id,
                     name: player_name,
                 };
-                let removed = room.cleanup_disconnected_lobby_players(self.lobby_disconnect_timeout_secs);
+                let (removed, renumbered) = room.cleanup_disconnected_lobby_players(self.lobby_disconnect_timeout_secs);
                 for (rid, rname) in &removed {
                     self.broadcast(code, ServerMsg::PlayerLeft {
                         player_id: *rid,
@@ -235,6 +233,7 @@ impl RoomManager {
                 } else {
                     let state = room.state.clone();
                     drop(room);
+                    self.remap_sessions(code, &renumbered);
                     self.broadcast(code, ServerMsg::State { state });
                 }
                 return Some(msg);
@@ -316,17 +315,31 @@ impl RoomManager {
                 }
             }
 
-            if let Some(new_creator) = room.players.iter().position(|p| !p.is_bot && p.id != player_id) {
-                room.players[new_creator].is_creator = true;
+            // Crown transfers to the next human in BOTH parallel vectors via
+            // the shared helper (the client renders state.players; a flag on
+            // room.players alone would leave everyone without a Start
+            // button), and the new creator is auto-ready.
+            if is_creator {
+                room.transfer_crown_from(player_id);
             }
 
             let token = room.players.iter().find(|p| p.id == player_id).and_then(|p| p.token.clone());
+            // An explicit Leave in the lobby is final: the seat is compacted
+            // out of the room immediately, so the leaver's pending-rejoin
+            // entry would point at a seat that no longer exists. Keeping it
+            // lets a late Rejoin restore_seat() onto whoever now sits in
+            // that slot — a silent seat hijack. Drop the entry here (the
+            // socket-drop path keeps its entry: that seat is NOT compacted
+            // yet, so a fast rejoin is legitimate there).
             if let Some(t) = token {
-                room.add_disconnected_player(player_id, t);
+                room.disconnected_players.retain(|(_, tok, _)| tok != &t);
             }
 
-            room.players.retain(|p| p.id != player_id);
-            room.state.players.retain(|p| p.id != player_id);
+            // Compact the seat out of every parallel vector (players,
+            // state.players, ready, state.ready, scores) and renumber
+            // survivors dense — the old two-line retain left the ready/score
+            // arrays misaligned and id = players.len() reused dead ids.
+            let renumbered = room.remove_lobby_seat(player_id);
 
             let state = room.state.clone();
             drop(room);
@@ -335,6 +348,7 @@ impl RoomManager {
                 player_id,
                 name: player_name.clone(),
             });
+            self.remap_sessions(code, &renumbered);
             self.broadcast(code, ServerMsg::State { state });
             return Some(ServerMsg::PlayerLeft {
                 player_id,
@@ -455,6 +469,29 @@ impl RoomManager {
                 let _ = sender.send(message.clone());
             }
         }
+    }
+
+    /// Remap session entries (and tell the clients) after a lobby compaction
+    /// renumbered seats. Without this, every survivor's stored player_id keeps
+    /// pointing at the OLD seat: their Ready/Play lands on whoever now sits in
+    /// that slot (wrong-seat play = invalid rejection or, worse, acting for
+    /// someone else) and personalise_for_viewer masks the wrong hand — a
+    /// card-privacy leak. Returns nothing; broadcasts SeatChanged.
+    pub fn remap_sessions(&self, code: &str, renumbered: &[(usize, usize)]) {
+        if renumbered.is_empty() {
+            return;
+        }
+        if let Some(mut entry) = self.sessions.get_mut(code) {
+            for e in entry.iter_mut() {
+                if let Some((_old, new)) = renumbered.iter().find(|(o, _)| *o == e.0) {
+                    e.0 = *new;
+                }
+            }
+        }
+        self.broadcast(
+            code,
+            ServerMsg::SeatChanged { renumbered: renumbered.to_vec() },
+        );
     }
 
     pub fn room_count(&self) -> usize {
@@ -1304,6 +1341,149 @@ mod tests {
         assert_eq!(room.players.len(), 1);
         assert_eq!(room.players[0].name, "Bob");
         assert!(room.players[0].is_creator);
+    }
+
+    #[test]
+    fn test_remove_player_lobby_renumbers_all_parallel_arrays() {
+        // MAJOR: creator leaves a public lobby. The room is NOT dissolved (only
+        // a PUBLIC creator dissolves... actually public creators DO dissolve,
+        // so use a PRIVATE room + non-creator leave first, then creator).
+        // Non-creator Bob leaves; seat 1 is removed and Dave takes the freed
+        // slot. EVERY parallel array (players, state.players, ready,
+        // state.ready, scores, total_scores) must stay the same length and
+        // seat ids must stay dense 0..n-1.
+        let manager = RoomManager::new(6, 2500, 30, 15);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), false);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+        manager.join_room(&code, "Charlie".to_string()).unwrap();
+
+        manager.remove_player(&code, 1); // Bob (seat 1) leaves
+
+        manager.join_room(&code, "Dave".to_string()).unwrap();
+
+        let room = manager.get_room(&code).unwrap();
+        // Same length across every player-shaped vector.
+        assert_eq!(room.players.len(), room.state.players.len());
+        assert_eq!(room.players.len(), room.ready.len());
+        assert_eq!(room.players.len(), room.state.ready.len());
+        assert_eq!(room.players.len(), room.state.scores.len());
+        // Seat ids dense 0..n-1 in both vectors, and the two agree.
+        let mut ids: Vec<usize> = room.players.iter().map(|p| p.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![0, 1, 2]);
+        let mut sids: Vec<usize> = room.state.players.iter().map(|p| p.id).collect();
+        sids.sort();
+        assert_eq!(sids, vec![0, 1, 2]);
+        assert!(room.players.iter().zip(room.state.players.iter()).all(|(a, b)| a.id == b.id));
+        // Dave got the freed slot, and his ready bit is the NEW one (false),
+        // not a stale leftover from a previous seat.
+        let dave = room.players.iter().find(|p| p.name == "Dave").unwrap();
+        assert!(!room.ready[dave.id]);
+        assert!(!room.state.ready[dave.id]);
+
+        // And the game must actually be startable afterwards.
+        for p in room.players.iter() {
+            if !p.is_bot {
+                manager.ready_player(&code, p.id, true).unwrap();
+            }
+        }
+        let creator = room.players.iter().find(|p| p.is_creator).unwrap();
+        assert!(manager.start_game(&code, creator.id).is_ok());
+    }
+
+    #[test]
+    fn test_remove_player_creator_transfer_reaches_state_players() {
+        // MAJOR: when the creator leaves the lobby, the crown moves to the
+        // next human. The client reads state.players (personalised broadcast),
+        // so the flag MUST be set there too — not only on room.players.
+        let manager = RoomManager::new(6, 2500, 30, 15);
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), false);
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+
+        manager.remove_player(&code, 0); // creator Alice leaves (private room)
+
+        let room = manager.get_room(&code).unwrap();
+        assert_eq!(room.players.len(), 1);
+        let bob_state = room.state.players.iter().find(|p| p.name == "Bob").unwrap();
+        assert!(bob_state.is_creator, "crown must be visible in state.players (what the client renders)");
+        // Ready arrays must have been compacted with the seat.
+        assert_eq!(room.state.ready.len(), 1);
+        assert_eq!(room.state.scores.len(), 1);
+        assert!(room.state.ready[0]); // Bob keeps a usable ready state
+    }
+
+    #[test]
+    fn test_lobby_disconnect_reap_frees_seat_without_stealing() {
+        // MAJOR: Bob's lobby seat is reaped after the disconnect timeout and
+        // Dave takes the freed slot. Bob's token is still inside
+        // disconnected_players (5-min rejoin window). A late rejoin by Bob
+        // must FAIL — restore_seat(1) would otherwise hijack Dave's seat.
+        let manager = RoomManager::new(6, 2500, 30, 1); // 1s lobby timeout
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+        let bob_token = match manager.join_room(&code, "Bob".to_string()).unwrap() {
+            (ServerMsg::Joined { token, .. }, _) => token,
+            _ => panic!("Expected Joined"),
+        };
+        manager.leave_room(&code, 1); // socket drop: seat marked disconnected
+        // Force the lobby reaper NOW (timeout 0 -> everything with a
+        // disconnect_time gets reaped instantly).
+        let reaped = manager
+            .rooms_ref()
+            .get_mut(&code)
+            .map(|mut r| r.cleanup_disconnected_lobby_players(0))
+            .unwrap_or_default();
+        assert!(reaped.0.iter().any(|(id, _)| *id == 1), "Bob's seat should be reaped");
+
+        manager.join_room(&code, "Dave".to_string()).unwrap();
+        let room = manager.get_room(&code).unwrap();
+        let dave = room.players.iter().find(|p| p.name == "Dave").unwrap();
+
+        // Bob's token must not be able to reclaim Dave's seat.
+        let rejoin = manager.rejoin_room(&code, "Bob", &bob_token);
+        let room2 = manager.get_room(&code).unwrap();
+        let dave2 = room2.players.iter().find(|p| p.id == dave.id).unwrap();
+        assert_eq!(dave2.name, "Dave", "rejoin must not steal a compacted seat");
+        // Either the rejoin failed, or (if a seat was found) it is Bob's OWN
+        // still-present seat — never Dave's.
+        if let Ok((ServerMsg::Rejoined { player_id, .. }, _)) = rejoin {
+            assert_ne!(player_id, dave.id);
+        }
+    }
+
+    #[test]
+    fn test_leave_room_creator_drop_transfers_crown_to_state() {
+        // MAJOR (same cluster, socket-drop variant): the creator CLOSES THE
+        // TAB (the most common mobile disconnect) in a private lobby. The
+        // crown must move to the next human in state.players too — otherwise,
+        // once the 15s reaper removes the creator's seat, NO seat has
+        // is_creator: the client renders no Start button for anyone and
+        // start_game() rejects every caller -> room stuck forever.
+        let manager = RoomManager::new(6, 2500, 30, 1); // 1s lobby timeout
+
+        let (code, _, _, _) = manager.create_room("Alice".to_string(), false); // private: no dissolve
+        manager.join_room(&code, "Bob".to_string()).unwrap();
+
+        manager.leave_room(&code, 0); // creator's socket drops
+
+        // Force the lobby reaper (timeout 0 -> instant).
+        let reaped = manager
+            .rooms_ref()
+            .get_mut(&code)
+            .map(|mut r| r.cleanup_disconnected_lobby_players(0))
+            .unwrap_or_default();
+        assert!(reaped.0.iter().any(|(_, n)| n == "Alice"), "creator seat should be reaped");
+
+        let room = manager.get_room(&code).unwrap();
+        let bob_state = room.state.players.iter().find(|p| p.name == "Bob").unwrap();
+        assert!(
+            bob_state.is_creator,
+            "crown must reach state.players (what the client renders) after a creator socket drop"
+        );
+        // And the room must actually be startable afterwards.
+        assert!(manager.start_game(&code, 0).is_ok());
     }
 
     #[test]
