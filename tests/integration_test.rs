@@ -286,10 +286,18 @@ fn test_combo_detection_matches_js() {
 
     assert!(matches!(combo::detect_combo(&[card(Rank::Three, Suit::Diamonds), card(Rank::Four, Suit::Diamonds), card(Rank::Five, Suit::Diamonds)]).unwrap().combo_type, ComboType::Straight));
 
-    assert!(matches!(combo::detect_combo(&[card(Rank::Ten, Suit::Diamonds), card(Rank::Jack, Suit::Diamonds), card(Rank::Queen, Suit::Diamonds)]).unwrap().combo_type, ComboType::Straight));
+    assert!(matches!(combo::detect_combo(&[card(Rank::Eight, Suit::Diamonds), card(Rank::Nine, Suit::Diamonds), card(Rank::Ten, Suit::Diamonds)]).unwrap().combo_type, ComboType::Straight));
+
+    assert!(matches!(combo::detect_combo(&[card(Rank::Jack, Suit::Diamonds), card(Rank::Queen, Suit::Diamonds), card(Rank::King, Suit::Diamonds)]).unwrap().combo_type, ComboType::Straight));
+
+    // 10-J-Q is mixed (10 is a number) — rejected
+    assert!(combo::detect_combo(&[card(Rank::Ten, Suit::Diamonds), card(Rank::Jack, Suit::Diamonds), card(Rank::Queen, Suit::Diamonds)]).is_none());
 
     // Mixed straight (9-10-J) should be rejected
     assert!(combo::detect_combo(&[card(Rank::Nine, Suit::Diamonds), card(Rank::Ten, Suit::Diamonds), card(Rank::Jack, Suit::Diamonds)]).is_none());
+
+    // Q-K-A: aces never in straights
+    assert!(combo::detect_combo(&[card(Rank::Queen, Suit::Diamonds), card(Rank::King, Suit::Diamonds), card(Rank::Ace, Suit::Diamonds)]).is_none());
 
     assert!(matches!(combo::detect_combo(&[card(Rank::King, Suit::Diamonds), card(Rank::King, Suit::Clubs), card(Rank::King, Suit::Hearts), card(Rank::Three, Suit::Diamonds), card(Rank::Three, Suit::Clubs)]).unwrap().combo_type, ComboType::FullHouse));
 

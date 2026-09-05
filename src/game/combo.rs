@@ -41,15 +41,15 @@ pub fn is_straight(ranks: &[usize]) -> bool {
         return false;
     }
 
-    // 2s cannot appear in straights
-    if unique.iter().any(|&r| r >= 12) {
+    // 2s and aces cannot appear in straights (A = index 12, 2 = index 13)
+    if unique.iter().any(|&r| r >= 11) {
         return false;
     }
 
-    // All numbers (3-9): rank indices 0-6
-    let all_numbers = unique.iter().all(|&r| r <= 6);
-    // All letters (10-A): rank indices 7-11
-    let all_letters = unique.iter().all(|&r| r >= 7);
+    // Number straight: 3-10, 3-5 consecutive cards (rank indices 0-7)
+    let all_numbers = unique.iter().all(|&r| r <= 7);
+    // Letter straight: exactly J-Q-K (rank indices 8-10)
+    let all_letters = unique.len() == 3 && unique.iter().all(|&r| (8..=10).contains(&r));
 
     if !all_numbers && !all_letters {
         return false;
@@ -259,18 +259,33 @@ mod tests {
     }
 
     #[test]
+    fn test_straight_numbers_up_to_10() {
+        assert!(is_straight(&[5, 6, 7])); // 8-9-10
+    }
+
+    #[test]
+    fn test_straight_5_cards_to_10() {
+        assert!(is_straight(&[3, 4, 5, 6, 7])); // 6-7-8-9-10
+    }
+
+    #[test]
     fn test_straight_letters() {
-        assert!(is_straight(&[7, 8, 9])); // 10-J-Q
+        assert!(is_straight(&[8, 9, 10])); // J-Q-K
     }
 
     #[test]
-    fn test_straight_10_j_q_k() {
-        assert!(is_straight(&[7, 8, 9, 10])); // 10-J-Q-K
+    fn test_straight_10_j_q_invalid() {
+        assert!(!is_straight(&[7, 8, 9])); // 10-J-Q — 10 is a number
     }
 
     #[test]
-    fn test_straight_10_j_q_k_a() {
-        assert!(is_straight(&[7, 8, 9, 10, 11])); // 10-J-Q-K-A
+    fn test_straight_10_j_q_k_invalid() {
+        assert!(!is_straight(&[7, 8, 9, 10])); // 10-J-Q-K — mixed
+    }
+
+    #[test]
+    fn test_straight_q_k_a_invalid() {
+        assert!(!is_straight(&[9, 10, 11])); // Q-K-A — no aces in straights
     }
 
     #[test]
@@ -280,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_straight_mixed_invalid() {
-        assert!(!is_straight(&[5, 6, 7])); // 9-10-J — mixed number/letter
+        assert!(!is_straight(&[5, 6, 7, 8])); // 8-9-10-J — mixed number/letter
     }
 
     #[test]
