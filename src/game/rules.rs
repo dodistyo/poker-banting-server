@@ -1,5 +1,5 @@
 use super::card::Card;
-use super::combo::{self, Combo};
+use super::combo::{self, Combo, ComboType};
 use super::state::{GameState, GamePhase, TrickState};
 
 pub struct ValidationResult {
@@ -29,30 +29,77 @@ pub fn validate_play(cards: &[Card], table_combo: Option<&Combo>) -> ValidationR
         },
     };
 
+    let combo_is_bomb = combo.combo_type == ComboType::Bomb;
+
     if let Some(tc) = table_combo {
-        if combo.cards.len() != tc.cards.len() || combo.combo_type != tc.combo_type {
-            return ValidationResult {
-                valid: false,
-                error: format!(
-                    "Must match: {} ({} cards).",
-                    combo_name(&tc),
-                    tc.cards.len()
-                ),
-                combo_name: combo_name(&combo),
-                combo: Some(combo),
-            };
+        let table_is_bomb = tc.combo_type == ComboType::Bomb;
+
+        if combo_is_bomb {
+            if table_is_bomb {
+                // Bomb vs bomb: only a strictly higher rank may counter.
+                if combo::compare_combos(&combo, tc).unwrap_or(0) <= 0 {
+                    return ValidationResult {
+                        valid: false,
+                        error: format!(
+                            "Cannot beat: {}",
+                            tc.cards.iter().map(|c| c.label()).collect::<Vec<_>>().join(" ")
+                        ),
+                        combo_name: combo_name(&combo),
+                        combo: Some(combo),
+                    };
+                }
+            } else if !(tc.combo_type == ComboType::Single && tc.cards[0].rank_index() == 12) {
+                // A bomb is a pure reaction: it is only legal against a
+                // single 2. It beats it outright — no compare needed.
+                return ValidationResult {
+                    valid: false,
+                    error: "Bomb can only counter a single 2.".to_string(),
+                    combo_name: combo_name(&combo),
+                    combo: Some(combo),
+                };
+            }
+        } else {
+            if table_is_bomb {
+                // Once a bomb is on the table, only a higher bomb or pass.
+                return ValidationResult {
+                    valid: false,
+                    error: "Only a higher bomb or pass is legal after a bomb.".to_string(),
+                    combo_name: combo_name(&combo),
+                    combo: Some(combo),
+                };
+            }
+            if combo.cards.len() != tc.cards.len() || combo.combo_type != tc.combo_type {
+                return ValidationResult {
+                    valid: false,
+                    error: format!(
+                        "Must match: {} ({} cards).",
+                        combo_name(&tc),
+                        tc.cards.len()
+                    ),
+                    combo_name: combo_name(&combo),
+                    combo: Some(combo),
+                };
+            }
+            if combo::compare_combos(&combo, tc).unwrap_or(0) <= 0 {
+                return ValidationResult {
+                    valid: false,
+                    error: format!(
+                        "Cannot beat: {}",
+                        tc.cards.iter().map(|c| c.label()).collect::<Vec<_>>().join(" ")
+                    ),
+                    combo_name: combo_name(&combo),
+                    combo: Some(combo),
+                };
+            }
         }
-        if combo::compare_combos(&combo, tc).unwrap_or(0) <= 0 {
-            return ValidationResult {
-                valid: false,
-                error: format!(
-                    "Cannot beat: {}",
-                    tc.cards.iter().map(|c| c.label()).collect::<Vec<_>>().join(" ")
-                ),
-                combo_name: combo_name(&combo),
-                combo: Some(combo),
-            };
-        }
+    } else if combo_is_bomb {
+        // A bomb can never open a trick.
+        return ValidationResult {
+            valid: false,
+            error: "Bomb cannot lead a trick.".to_string(),
+            combo_name: combo_name(&combo),
+            combo: Some(combo),
+        };
     }
 
     ValidationResult {
@@ -223,6 +270,73 @@ pub fn check_trick_complete(state: &GameState) -> Option<usize> {
     None
 }
 
+/// Bomb endgame. When the trick on the table is a bomb AND the trick is
+/// complete (the other three players all had their turn — pass or
+/// counter-bomb), the round ends IMMEDIATELY instead of resolving:
+///
+///   last (highest) bomber = 1st (+10)
+///   the bombed player     = 4th (-15) — the single-2 holder, or the FIRST
+///                        bomber if the bomb was countered
+///   the other two         = 0
+///
+/// Returns true if the game just ended. Every play/pass path (engine and
+/// bot loop) must consult this before a normal `resolve_trick`.
+pub fn maybe_end_game_by_bomb(state: &mut GameState) -> bool {
+    if state.trick.combo_type != Some(ComboType::Bomb) {
+        return false;
+    }
+    if check_trick_complete(state).is_none() {
+        return false;
+    }
+    let winner = match state.trick.combo_player {
+        Some(w) => w,
+        None => return false,
+    };
+    // The player pushed last into `played` held the table when the final
+    // bomb went down: the single-2 holder for an uncountered bomb, or the
+    // first bomber when the bomb was countered.
+    let victim = state.trick.played.last().copied();
+
+    state.scores = vec![0; 4];
+    state.scores[winner] = 10;
+    if let Some(v) = victim {
+        state.scores[v] = -15;
+    }
+
+    state.finished_order.clear();
+    state.finished_order.push(winner);
+    for i in 0..4 {
+        if i != winner && Some(i) != victim {
+            state.finished_order.push(i);
+        }
+    }
+    if let Some(v) = victim {
+        state.finished_order.push(v);
+    }
+
+    for i in 0..4 {
+        state.players[i].finished = true;
+    }
+    state.log.push(format!(
+        "BOOM! {} wins with a bomb (+10)",
+        state.players[winner].name
+    ));
+    if let Some(v) = victim {
+        state.log.push(format!(
+            "{} got bombed (-15)",
+            state.players[v].name
+        ));
+    }
+
+    state.trick = TrickState::new();
+    state.ensure_total_scores();
+    for i in 0..4.min(state.players.len()) {
+        state.total_scores[i] += state.scores[i];
+    }
+    state.phase = GamePhase::GameOver;
+    true
+}
+
 pub fn skip_finished(state: &mut GameState) {
     while state.players[state.current_player].finished {
         state.current_player = (state.current_player + 1) % 4;
@@ -298,6 +412,9 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
             state.trick.combo_player = Some(cp);
 
             if let Some(winner) = check_trick_complete(state) {
+                if maybe_end_game_by_bomb(state) {
+                    return false;
+                }
                 resolve_trick(state, winner);
                 if end_game(state) {
                     return false;
@@ -311,6 +428,9 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
 
         if non_participants(state) >= 3 {
             if let Some(winner) = state.trick.combo_player {
+                if maybe_end_game_by_bomb(state) {
+                    return false;
+                }
                 resolve_trick(state, winner);
                 if end_game(state) {
                     return false;
@@ -402,6 +522,82 @@ mod tests {
         let table = combo::detect_combo(&[card(Rank::Three, Suit::Diamonds)]).unwrap();
         let cards = vec![card(Rank::Three, Suit::Spades)];
         let result = validate_play(&cards, Some(&table));
+        assert!(!result.valid);
+    }
+
+    // --- bomb tests ---
+
+    fn bomb_cards(rank: Rank) -> Vec<Card> {
+        vec![
+            card(rank, Suit::Diamonds),
+            card(rank, Suit::Clubs),
+            card(rank, Suit::Hearts),
+            card(rank, Suit::Spades),
+        ]
+    }
+
+    #[test]
+    fn test_bomb_cannot_lead() {
+        // Bomb is a reaction card — it may never open a trick.
+        let result = validate_play(&bomb_cards(Rank::King), None);
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn test_bomb_cannot_beat_normal_single() {
+        let table = combo::detect_combo(&[card(Rank::King, Suit::Diamonds)]).unwrap();
+        let result = validate_play(&bomb_cards(Rank::Five), Some(&table));
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn test_bomb_beats_single_two() {
+        let table = combo::detect_combo(&[card(Rank::Two, Suit::Diamonds)]).unwrap();
+        let result = validate_play(&bomb_cards(Rank::Five), Some(&table));
+        assert!(result.valid);
+        assert_eq!(result.combo_name, "Bomb");
+    }
+
+    #[test]
+    fn test_bomb_cannot_beat_pair_two() {
+        let table = combo::detect_combo(&[
+            card(Rank::Two, Suit::Diamonds),
+            card(Rank::Two, Suit::Clubs),
+        ]).unwrap();
+        let result = validate_play(&bomb_cards(Rank::King), Some(&table));
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn test_bomb_cannot_beat_triple_two() {
+        let table = combo::detect_combo(&[
+            card(Rank::Two, Suit::Diamonds),
+            card(Rank::Two, Suit::Clubs),
+            card(Rank::Two, Suit::Hearts),
+        ]).unwrap();
+        let result = validate_play(&bomb_cards(Rank::King), Some(&table));
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn test_higher_bomb_counters_lower_bomb() {
+        let table = combo::detect_combo(&bomb_cards(Rank::Five)).unwrap();
+        let result = validate_play(&bomb_cards(Rank::King), Some(&table));
+        assert!(result.valid);
+    }
+
+    #[test]
+    fn test_lower_bomb_cannot_counter_higher_bomb() {
+        let table = combo::detect_combo(&bomb_cards(Rank::King)).unwrap();
+        let result = validate_play(&bomb_cards(Rank::Five), Some(&table));
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn test_normal_cards_cannot_follow_bomb() {
+        // Once a bomb is on the table, only a higher bomb or pass is legal.
+        let table = combo::detect_combo(&bomb_cards(Rank::Five)).unwrap();
+        let result = validate_play(&[card(Rank::Two, Suit::Spades)], Some(&table));
         assert!(!result.valid);
     }
 

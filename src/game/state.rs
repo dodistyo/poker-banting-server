@@ -305,7 +305,7 @@ impl Room {
         self.state.three_discard = None;
 
         let mut engine = crate::game::engine::GameEngine::new(self.state.clone());
-        engine.deal_cards();
+        engine.deal_cards_guarded();
         engine.state_mut().phase = GamePhase::Playing;
         engine.state_mut().current_player = prev_winner.unwrap_or(0);
         self.state = engine.state().clone();
@@ -319,7 +319,7 @@ impl Room {
 
     pub fn deal_and_start_discard(&mut self) {
         let mut engine = crate::game::engine::GameEngine::new(self.state.clone());
-        engine.deal_cards();
+        engine.deal_cards_guarded();
         engine.start_three_discard();
         self.state = engine.state().clone();
     }

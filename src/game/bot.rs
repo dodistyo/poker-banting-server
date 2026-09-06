@@ -185,6 +185,24 @@ fn find_valid_combos(hand: &[Card]) -> Vec<ValidCombo> {
         }
     }
 
+    // Bombs (4 cards of the same rank, any suit). A hand can hold at most
+    // one bomb, so a single pass over rank groups is enough.
+    let mut by_rank: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (i, c) in hand.iter().enumerate() {
+        by_rank.entry(c.rank_index()).or_insert_with(Vec::new).push(i);
+    }
+    for indices in by_rank.values() {
+        if indices.len() == 4 {
+            let cards: Vec<Card> = indices.iter().map(|&i| hand[i].clone()).collect();
+            if let Some(combo) = combo::detect_combo(&cards) {
+                combos.push(ValidCombo {
+                    indices: indices.clone(),
+                    combo,
+                });
+            }
+        }
+    }
+
     combos
 }
 
@@ -213,6 +231,14 @@ fn combo_strength(hand: &[Card], valid_combo: &ValidCombo) -> i32 {
         ComboType::FourKind => {
             let quad_rank = valid_combo.combo.cards[0].rank_index() as i32;
             quad_rank * 10 + 100
+        }
+        ComboType::Bomb => {
+            // Bombs are reaction-only (validate_play gates them), so free
+            // play should almost never pick one. High base strength keeps
+            // them below singles in preference; the lowest legal bomb rank
+            // is still preferred when a bomb IS the right play.
+            let bomb_rank = valid_combo.combo.cards[0].rank_index() as i32;
+            9000 + bomb_rank * 10
         }
     }
 }

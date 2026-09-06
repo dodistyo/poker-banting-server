@@ -9,6 +9,7 @@ pub enum ComboType {
     Straight,
     FullHouse,
     FourKind,
+    Bomb,
 }
 
 impl std::fmt::Display for ComboType {
@@ -20,6 +21,7 @@ impl std::fmt::Display for ComboType {
             ComboType::Straight => write!(f, "Straight"),
             ComboType::FullHouse => write!(f, "Full House"),
             ComboType::FourKind => write!(f, "Four of a Kind"),
+            ComboType::Bomb => write!(f, "Bomb"),
         }
     }
 }
@@ -110,7 +112,14 @@ pub fn detect_combo(cards: &[Card]) -> Option<Combo> {
             }
         }
         4 => {
-            if is_same_suit && is_straight(&ranks) {
+            if counts[0] == 4 {
+                // Bomb: four cards of the same rank (any rank, suits don't
+                // matter). Reaction only — validate_play gates when it's legal.
+                Some(Combo {
+                    combo_type: ComboType::Bomb,
+                    cards: sorted,
+                })
+            } else if is_same_suit && is_straight(&ranks) {
                 Some(Combo {
                     combo_type: ComboType::Straight,
                     cards: sorted,
@@ -185,6 +194,12 @@ pub fn compare_combos(combo_a: &Combo, combo_b: &Combo) -> Option<i32> {
             let a_kicker = find_kicker(&combo_a.cards, a_quad_rank);
             let b_kicker = find_kicker(&combo_b.cards, b_quad_rank);
             Some(a_kicker as i32 - b_kicker as i32)
+        }
+        ComboType::Bomb => {
+            // All four cards share one rank (sorted ascending → cards[0]).
+            let a_rank = combo_a.cards[0].rank_index() as i32;
+            let b_rank = combo_b.cards[0].rank_index() as i32;
+            Some(a_rank - b_rank)
         }
     }
 }
@@ -554,5 +569,71 @@ mod tests {
             card(Rank::Three, Suit::Diamonds),
         ]).unwrap();
         assert!(compare_combos(&a, &b).unwrap() > 0);
+    }
+
+    // --- bomb tests ---
+
+    fn bomb_cards(rank: Rank) -> Vec<Card> {
+        vec![
+            card(rank, Suit::Diamonds),
+            card(rank, Suit::Clubs),
+            card(rank, Suit::Hearts),
+            card(rank, Suit::Spades),
+        ]
+    }
+
+    #[test]
+    fn test_bomb_detected() {
+        let combo = detect_combo(&bomb_cards(Rank::King)).unwrap();
+        assert_eq!(combo.combo_type, ComboType::Bomb);
+    }
+
+    #[test]
+    fn test_bomb_two_detected() {
+        // Detection only — the deal guard (rules::deal_no_poker) prevents
+        // any player from ever HOLDING four 2s in a live round.
+        let combo = detect_combo(&bomb_cards(Rank::Two)).unwrap();
+        assert_eq!(combo.combo_type, ComboType::Bomb);
+    }
+
+    #[test]
+    fn test_bomb_not_4card_straight() {
+        // 4 cards, all same rank — must be a bomb, not rejected.
+        let combo = detect_combo(&bomb_cards(Rank::Five)).unwrap();
+        assert_eq!(combo.combo_type, ComboType::Bomb);
+        // 3-of-a-kind + kicker (4 cards) is NOT a bomb.
+        let mixed = vec![
+            card(Rank::Five, Suit::Diamonds),
+            card(Rank::Five, Suit::Clubs),
+            card(Rank::Five, Suit::Hearts),
+            card(Rank::Nine, Suit::Spades),
+        ];
+        assert!(detect_combo(&mixed).is_none());
+    }
+
+    #[test]
+    fn test_bomb_compare_higher_wins() {
+        let a = detect_combo(&bomb_cards(Rank::King)).unwrap();
+        let b = detect_combo(&bomb_cards(Rank::Seven)).unwrap();
+        assert!(compare_combos(&a, &b).unwrap() > 0);
+        assert!(compare_combos(&b, &a).unwrap() < 0);
+    }
+
+    #[test]
+    fn test_bomb_compare_equal_rank() {
+        let a = detect_combo(&bomb_cards(Rank::Five)).unwrap();
+        let b = detect_combo(&bomb_cards(Rank::Five)).unwrap();
+        assert_eq!(compare_combos(&a, &b).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_bomb_vs_other_type_compare_is_none() {
+        let bomb = detect_combo(&bomb_cards(Rank::King)).unwrap();
+        let straight = detect_combo(&[
+            card(Rank::Three, Suit::Diamonds),
+            card(Rank::Four, Suit::Diamonds),
+            card(Rank::Five, Suit::Diamonds),
+        ]).unwrap();
+        assert_eq!(compare_combos(&bomb, &straight), None);
     }
 }

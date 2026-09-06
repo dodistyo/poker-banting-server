@@ -302,6 +302,20 @@ fn test_combo_detection_matches_js() {
     assert!(matches!(combo::detect_combo(&[card(Rank::King, Suit::Diamonds), card(Rank::King, Suit::Clubs), card(Rank::King, Suit::Hearts), card(Rank::Three, Suit::Diamonds), card(Rank::Three, Suit::Clubs)]).unwrap().combo_type, ComboType::FullHouse));
 
     assert!(matches!(combo::detect_combo(&[card(Rank::King, Suit::Diamonds), card(Rank::King, Suit::Clubs), card(Rank::King, Suit::Hearts), card(Rank::King, Suit::Spades), card(Rank::Three, Suit::Diamonds)]).unwrap().combo_type, ComboType::FourKind));
+
+    // Bomb: four of the same rank (any suit), 4 cards
+    assert!(matches!(combo::detect_combo(&[card(Rank::King, Suit::Diamonds), card(Rank::King, Suit::Clubs), card(Rank::King, Suit::Hearts), card(Rank::King, Suit::Spades)]).unwrap().combo_type, ComboType::Bomb));
+
+    // Same-suit 4-card straight is still a straight, not a bomb
+    assert!(matches!(combo::detect_combo(&[card(Rank::Seven, Suit::Hearts), card(Rank::Eight, Suit::Hearts), card(Rank::Nine, Suit::Hearts), card(Rank::Ten, Suit::Hearts)]).unwrap().combo_type, ComboType::Straight));
+
+    // Bomb validate_play parity: only counters a single 2 or a higher bomb
+    let table = combo::detect_combo(&[card(Rank::Two, Suit::Diamonds)]).unwrap();
+    let bomb_k = combo::detect_combo(&[card(Rank::King, Suit::Diamonds), card(Rank::King, Suit::Clubs), card(Rank::King, Suit::Hearts), card(Rank::King, Suit::Spades)]).unwrap();
+    assert!(validate_play(&bomb_k.cards, Some(&table)).valid);
+    let table = combo::detect_combo(&[card(Rank::King, Suit::Diamonds)]).unwrap();
+    assert!(!validate_play(&bomb_k.cards, Some(&table)).valid);
+    assert!(!validate_play(&bomb_k.cards, None).valid);
 }
 
 #[test]

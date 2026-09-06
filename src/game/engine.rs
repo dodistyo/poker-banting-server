@@ -55,6 +55,38 @@ impl GameEngine {
         }
     }
 
+    /// Deal that can never give any player all four 2s. A hand holding all
+    /// four 2s is dead weight: bombs can't lead and only counter a single 2,
+    /// so those cards could never come down. Reshuffles until clean.
+    pub fn deal_cards_guarded(&mut self) {
+        use super::card::{create_deck, shuffle, sort_cards};
+
+        loop {
+            let mut deck = create_deck();
+            shuffle(&mut deck);
+
+            let mut hands: Vec<Vec<Card>> = Vec::new();
+            for _ in 0..4 {
+                let hand: Vec<Card> = deck.drain(..13).collect();
+                let mut sorted_hand = hand;
+                sort_cards(&mut sorted_hand);
+                hands.push(sorted_hand);
+            }
+
+            if hands
+                .iter()
+                .any(|h| h.iter().filter(|c| c.rank_index() == 12).count() == 4)
+            {
+                continue; // someone grabbed all four 2s — redeal
+            }
+
+            for (i, hand) in hands.into_iter().enumerate() {
+                self.state.players[i].hand = hand;
+            }
+            return;
+        }
+    }
+
     pub fn start_three_discard(&mut self) -> Vec<GameEvent> {
         let events = Vec::new();
 
@@ -248,6 +280,15 @@ impl GameEngine {
         }
 
         if let Some(winner) = super::rules::check_trick_complete(&self.state) {
+            // Bomb endgame: a completed bomb trick ends the round right now
+            // (bomber 1st, bombed player 4th, others 0) — no trick resolve.
+            if super::rules::maybe_end_game_by_bomb(&mut self.state) {
+                events.push(GameEvent::GameOver {
+                    final_scores: self.state.scores.clone(),
+                    finished_order: self.state.finished_order.clone(),
+                });
+                return events;
+            }
             self.resolve_trick(winner, &mut events);
             if self.state.finished_order.len() >= 3 && self.state.phase != GamePhase::GameOver {
                 self.check_and_end_game(&mut events);
@@ -301,6 +342,13 @@ impl GameEngine {
 
         if super::rules::non_participants(&self.state) >= 3 {
             if let Some(winner) = self.state.trick.combo_player {
+                if super::rules::maybe_end_game_by_bomb(&mut self.state) {
+                    events.push(GameEvent::GameOver {
+                        final_scores: self.state.scores.clone(),
+                        finished_order: self.state.finished_order.clone(),
+                    });
+                    return events;
+                }
                 self.resolve_trick(winner, &mut events);
                 if self.state.finished_order.len() >= 3
                     && self.state.phase != GamePhase::GameOver
@@ -379,5 +427,272 @@ impl GameEngine {
 
     pub fn state_mut(&mut self) -> &mut GameState {
         &mut self.state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::card::{Card, Rank, Suit};
+    use crate::game::state::{GamePhase, Player};
+
+    fn card(rank: Rank, suit: Suit) -> Card {
+        Card::new(rank, suit)
+    }
+
+    fn p(name: &str, hand: Vec<Card>) -> Player {
+        Player {
+            id: 0,
+            name: name.to_string(),
+            hand,
+            finished: false,
+            is_bot: false,
+            connected: true,
+            is_creator: false,
+        }
+    }
+
+    /// Fixed 52-card deal:
+    /// P0: 2d 3d 4d 5d 6d 7d 8d 9d 10d Jd Qd Ad 2h
+    /// P1: Kd Kc Kh Ks 3c 4c 5c 6c 7c 8c 9c 10c Jc
+    /// P2: 3h 4h 5h 6h 7h 8h 9h 10h Jh Qh Ah 2s Qc
+    /// P3: 3s 4s 5s 6s 7s 8s 9s 10s Js Qs As 2c Ac
+    fn bomb_state() -> GameState {
+        let p0 = vec![
+            card(Rank::Two, Suit::Diamonds),
+            card(Rank::Three, Suit::Diamonds),
+            card(Rank::Four, Suit::Diamonds),
+            card(Rank::Five, Suit::Diamonds),
+            card(Rank::Six, Suit::Diamonds),
+            card(Rank::Seven, Suit::Diamonds),
+            card(Rank::Eight, Suit::Diamonds),
+            card(Rank::Nine, Suit::Diamonds),
+            card(Rank::Ten, Suit::Diamonds),
+            card(Rank::Jack, Suit::Diamonds),
+            card(Rank::Queen, Suit::Diamonds),
+            card(Rank::Ace, Suit::Diamonds),
+            card(Rank::Two, Suit::Hearts),
+        ];
+        let p1 = vec![
+            card(Rank::King, Suit::Diamonds),
+            card(Rank::King, Suit::Clubs),
+            card(Rank::King, Suit::Hearts),
+            card(Rank::King, Suit::Spades),
+            card(Rank::Three, Suit::Clubs),
+            card(Rank::Four, Suit::Clubs),
+            card(Rank::Five, Suit::Clubs),
+            card(Rank::Six, Suit::Clubs),
+            card(Rank::Seven, Suit::Clubs),
+            card(Rank::Eight, Suit::Clubs),
+            card(Rank::Nine, Suit::Clubs),
+            card(Rank::Ten, Suit::Clubs),
+            card(Rank::Jack, Suit::Clubs),
+        ];
+        let p2 = vec![
+            card(Rank::Three, Suit::Hearts),
+            card(Rank::Four, Suit::Hearts),
+            card(Rank::Five, Suit::Hearts),
+            card(Rank::Six, Suit::Hearts),
+            card(Rank::Seven, Suit::Hearts),
+            card(Rank::Eight, Suit::Hearts),
+            card(Rank::Nine, Suit::Hearts),
+            card(Rank::Ten, Suit::Hearts),
+            card(Rank::Jack, Suit::Hearts),
+            card(Rank::Queen, Suit::Hearts),
+            card(Rank::Ace, Suit::Hearts),
+            card(Rank::Two, Suit::Spades),
+            card(Rank::Queen, Suit::Clubs),
+        ];
+        let p3 = vec![
+            card(Rank::Three, Suit::Spades),
+            card(Rank::Four, Suit::Spades),
+            card(Rank::Five, Suit::Spades),
+            card(Rank::Six, Suit::Spades),
+            card(Rank::Seven, Suit::Spades),
+            card(Rank::Eight, Suit::Spades),
+            card(Rank::Nine, Suit::Spades),
+            card(Rank::Ten, Suit::Spades),
+            card(Rank::Jack, Suit::Spades),
+            card(Rank::Queen, Suit::Spades),
+            card(Rank::Ace, Suit::Spades),
+            card(Rank::Two, Suit::Clubs),
+            card(Rank::Ace, Suit::Clubs),
+        ];
+        let mut players = vec![p("P0", p0), p("P1", p1), p("P2", p2), p("P3", p3)];
+        for (i, pl) in players.iter_mut().enumerate() {
+            pl.id = i;
+        }
+        GameState {
+            phase: GamePhase::Playing,
+            players,
+            ready: vec![true; 4],
+            current_player: 0,
+            trick: TrickState::new(),
+            finished_order: Vec::new(),
+            scores: vec![0; 4],
+            round: 1,
+            total_scores: vec![0],
+            three_discard: None,
+            log: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_bomb_without_counter_ends_game() {
+        let mut engine = GameEngine::new(bomb_state());
+        // P0 leads single 2 (the only thing a bomb can answer)
+        engine.apply_play(0, &["2:diamonds".to_string()]);
+        assert_eq!(engine.state().phase, GamePhase::Playing);
+        // P1 bombs with four Kings
+        engine.apply_play(
+            1,
+            &["K:diamonds".to_string(), "K:clubs".to_string(), "K:hearts".to_string(), "K:spades".to_string()],
+        );
+        assert_eq!(engine.state().trick.combo_type, Some(crate::game::combo::ComboType::Bomb));
+        assert_eq!(engine.state().phase, GamePhase::Playing); // trick not over yet
+        engine.apply_pass(2);
+        engine.apply_pass(3);
+        // Victim P0 gets a turn too (could counter-bomb) — passes
+        engine.apply_pass(0);
+
+        assert_eq!(engine.state().phase, GamePhase::GameOver);
+        // Bomber 1st (+10), victim of single 2 is 4th (-15), others 0
+        assert_eq!(engine.state().scores, vec![-15, 10, 0, 0]);
+        assert_eq!(engine.state().finished_order[0], 1);
+        assert_eq!(engine.state().finished_order[3], 0);
+        // Session totals baked in
+        assert_eq!(engine.state().total_scores, vec![-15, 10, 0, 0]);
+    }
+
+    #[test]
+    fn test_bomb_counter_scores_first_bomber_last() {
+        // Custom deal: P0 leads 2d; P1 bombs 4x7; P2 counters with 4xK;
+        // P3 passes; P0 passes; P1 passes -> game over.
+        let p0 = vec![
+            card(Rank::Two, Suit::Diamonds),
+            card(Rank::Three, Suit::Diamonds),
+            card(Rank::Four, Suit::Diamonds),
+            card(Rank::Five, Suit::Diamonds),
+            card(Rank::Six, Suit::Diamonds),
+            card(Rank::Eight, Suit::Diamonds),
+            card(Rank::Nine, Suit::Diamonds),
+            card(Rank::Ten, Suit::Diamonds),
+            card(Rank::Jack, Suit::Diamonds),
+            card(Rank::Queen, Suit::Diamonds),
+            card(Rank::Ace, Suit::Diamonds),
+            card(Rank::Two, Suit::Hearts),
+            card(Rank::Three, Suit::Clubs),
+        ];
+        let p1 = vec![
+            card(Rank::Seven, Suit::Diamonds),
+            card(Rank::Seven, Suit::Clubs),
+            card(Rank::Seven, Suit::Hearts),
+            card(Rank::Seven, Suit::Spades),
+            card(Rank::Three, Suit::Hearts),
+            card(Rank::Four, Suit::Hearts),
+            card(Rank::Five, Suit::Hearts),
+            card(Rank::Six, Suit::Hearts),
+            card(Rank::Eight, Suit::Hearts),
+            card(Rank::Nine, Suit::Hearts),
+            card(Rank::Ten, Suit::Hearts),
+            card(Rank::Jack, Suit::Hearts),
+            card(Rank::Queen, Suit::Hearts),
+        ];
+        let p2 = vec![
+            card(Rank::King, Suit::Diamonds),
+            card(Rank::King, Suit::Clubs),
+            card(Rank::King, Suit::Hearts),
+            card(Rank::King, Suit::Spades),
+            card(Rank::Three, Suit::Spades),
+            card(Rank::Four, Suit::Spades),
+            card(Rank::Five, Suit::Spades),
+            card(Rank::Six, Suit::Spades),
+            card(Rank::Eight, Suit::Spades),
+            card(Rank::Nine, Suit::Spades),
+            card(Rank::Ten, Suit::Spades),
+            card(Rank::Jack, Suit::Spades),
+            card(Rank::Queen, Suit::Spades),
+        ];
+        let p3 = vec![
+            card(Rank::Eight, Suit::Clubs),
+            card(Rank::Nine, Suit::Clubs),
+            card(Rank::Ten, Suit::Clubs),
+            card(Rank::Jack, Suit::Clubs),
+            card(Rank::Queen, Suit::Clubs),
+            card(Rank::Ace, Suit::Clubs),
+            card(Rank::Ace, Suit::Diamonds),
+            card(Rank::Ace, Suit::Hearts),
+            card(Rank::Ace, Suit::Spades),
+            card(Rank::Two, Suit::Clubs),
+            card(Rank::Two, Suit::Spades),
+            card(Rank::Six, Suit::Clubs),
+            card(Rank::Nine, Suit::Diamonds),
+        ];
+        let mut players = vec![p("P0", p0), p("P1", p1), p("P2", p2), p("P3", p3)];
+        for (i, pl) in players.iter_mut().enumerate() {
+            pl.id = i;
+        }
+        let mut engine = GameEngine::new(GameState {
+            phase: GamePhase::Playing,
+            players,
+            ready: vec![true; 4],
+            current_player: 0,
+            trick: TrickState::new(),
+            finished_order: Vec::new(),
+            scores: vec![0; 4],
+            round: 1,
+            total_scores: vec![0],
+            three_discard: None,
+            log: Vec::new(),
+        });
+
+        engine.apply_play(0, &["2:diamonds".to_string()]);
+        engine.apply_play(
+            1,
+            &["7:diamonds".to_string(), "7:clubs".to_string(), "7:hearts".to_string(), "7:spades".to_string()],
+        );
+        // P2 counters with four Kings (higher than four Sevens)
+        engine.apply_play(
+            2,
+            &["K:diamonds".to_string(), "K:clubs".to_string(), "K:hearts".to_string(), "K:spades".to_string()],
+        );
+        engine.apply_pass(3);
+        engine.apply_pass(0);
+        engine.apply_pass(1);
+
+        assert_eq!(engine.state().phase, GamePhase::GameOver);
+        // LAST bomber (P2) is 1st; FIRST bomber (P1) is 4th — the single-2
+        // holder (P0) is NOT the loser anymore.
+        assert_eq!(engine.state().scores, vec![0, -15, 10, 0]);
+        assert_eq!(engine.state().finished_order[0], 2);
+        assert_eq!(engine.state().finished_order[3], 1);
+    }
+
+    #[test]
+    fn test_lower_bomb_cannot_counter_higher_bomb_in_engine() {
+        let mut engine = GameEngine::new(bomb_state());
+        engine.apply_play(0, &["2:diamonds".to_string()]);
+        // P1 bombs with four Kings (highest possible)
+        engine.apply_play(
+            1,
+            &["K:diamonds".to_string(), "K:clubs".to_string(), "K:hearts".to_string(), "K:spades".to_string()],
+        );
+        // P2 tries to counter with a plain single — must be rejected
+        let before = engine.state().trick.cards.len();
+        engine.apply_play(2, &["3:hearts".to_string()]);
+        assert_eq!(engine.state().trick.cards.len(), before); // trick unchanged
+        assert_eq!(engine.state().players[2].hand.len(), 13);
+    }
+
+    #[test]
+    fn test_deal_cards_guarded_never_deals_four_twos() {
+        for _ in 0..50 {
+            let mut engine = GameEngine::new(bomb_state());
+            engine.deal_cards_guarded();
+            for p in &engine.state().players {
+                let twos = p.hand.iter().filter(|c| c.rank_index() == 12).count();
+                assert!(twos < 4, "player dealt four 2s");
+            }
+        }
     }
 }
