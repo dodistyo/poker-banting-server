@@ -21,6 +21,7 @@ pub struct PublicRoomSummary {
 
 type SessionSender = Arc<UnboundedSender<Message>>;
 
+#[derive(Clone)]
 pub struct RoomManager {
     rooms: Arc<DashMap<String, Room>>,
     // (player_id, sender): every connection knows which seat it belongs to,
@@ -535,6 +536,44 @@ impl RoomManager {
         result
     }
 
+    /// Host-only room settings (play limit + winning point). Editable only
+    /// while the room is in Lobby or GameOver; clamped to sane ranges.
+    /// `None` leaves a setting unchanged. Broadcasts `RoomSettings` on success.
+    pub fn set_room_settings(
+        &self,
+        code: &str,
+        player_id: usize,
+        play_limit_secs: Option<u32>,
+        winning_point: Option<u32>,
+    ) -> Result<ServerMsg, String> {
+        let mut room = self.rooms.get_mut(code).ok_or("Room not found")?;
+        if !room.players.iter().any(|p| p.id == player_id && p.is_creator) {
+            return Err("Only the host can change room settings".to_string());
+        }
+        if room.state.phase != GamePhase::Lobby && room.state.phase != GamePhase::GameOver {
+            return Err("Room settings are locked during play".to_string());
+        }
+        if play_limit_secs.is_none() && winning_point.is_none() {
+            return Err("Nothing to update".to_string());
+        }
+        let play_limit = match play_limit_secs {
+            Some(v) if (1..=120).contains(&v) => v,
+            Some(_) => return Err("Play limit must be 1-120 seconds".to_string()),
+            None => room.state.play_limit_secs,
+        };
+        let point = match winning_point {
+            Some(v) if (1..=9999).contains(&v) => v,
+            Some(_) => return Err("Winning point must be 1-9999".to_string()),
+            None => room.state.winning_point,
+        };
+        room.state.play_limit_secs = play_limit;
+        room.state.winning_point = point;
+        Ok(ServerMsg::RoomSettings {
+            play_limit_secs: play_limit,
+            winning_point: point,
+        })
+    }
+
     pub fn ready_player(&self, code: &str, player_id: usize, ready: bool) -> Result<ServerMsg, String> {
         let mut room = self.rooms.get_mut(code).ok_or("Room not found")?;
         room.set_ready(player_id, ready)?;
@@ -552,6 +591,9 @@ impl RoomManager {
         let mut room = self.rooms.get_mut(code).ok_or("Room not found")?;
         if !room.players.iter().any(|p| p.id == player_id && p.is_creator) {
             return Err("Only the room creator can start the game".to_string());
+        }
+        if room.state.game_winner.is_some() {
+            return Err("Match already won — a new game is locked".to_string());
         }
         // Only a Lobby can start a fresh game, or a GameOver can continue the
         // session into the next round. (Also prevents a stray StartGame from
@@ -602,6 +644,71 @@ impl RoomManager {
 
     pub fn get_bot_turn_delay_ms(&self) -> u64 {
         self.bot_turn_delay_ms
+    }
+
+    /// Arm the play-limit watchdog on the current turn if it belongs to a
+    /// human (bots are exempt): after `play_limit_secs` of silence the seat
+    /// is auto-moved (lowest legal single, else pass) and logged. The
+    /// `turn_seq` captured at spawn cancels a stale timer once the turn
+    /// moves on.
+    pub fn spawn_turn_watchdog(&self, code: &str) {
+        let state = match self.get_state(code) {
+            Some(s) => s,
+            None => return,
+        };
+        if state.phase != GamePhase::Playing {
+            return;
+        }
+        let cp = state.current_player;
+        if cp >= state.players.len() || state.players[cp].is_bot || state.players[cp].finished {
+            return;
+        }
+        let limit = state.play_limit_secs.max(1);
+        let seq = state.turn_seq;
+        let mgr = self.clone();
+        let code_owned = code.to_string();
+        // Fire-and-forget: must NOT block the bot-turn driver for the whole
+        // play limit. `turn_seq` mismatch cancels a stale timer.
+        tokio::spawn(async move {
+            mgr.run_watchdog(code_owned, seq, limit).await;
+        });
+    }
+
+    /// The watchdog body, kept separate from `spawn_turn_watchdog` so the
+    /// caller (async context) drives it with a direct `.await` — no
+    /// `tokio::spawn` needed (and no escaping borrows).
+    pub async fn run_watchdog(&self, code: String, seq: u32, limit_secs: u32) {
+            tokio::time::sleep(std::time::Duration::from_secs(limit_secs as u64)).await;
+            let state = match self.get_state(&code) {
+                Some(s) => s,
+                None => return,
+            };
+            if state.phase != GamePhase::Playing || state.turn_seq != seq {
+                return;
+            }
+            let cp = state.current_player;
+            if cp >= state.players.len() || state.players[cp].is_bot || state.players[cp].finished {
+                return;
+            }
+            let move_ = crate::game::rules::idle_auto_move(&state, cp);
+            let mut engine = crate::game::engine::GameEngine::new(state);
+            match &move_ {
+                Some(cards) => {
+                    engine.apply_play(cp, cards);
+                }
+                None => {
+                    engine.apply_pass(cp);
+                }
+            }
+            let mut new_state = engine.state().clone();
+            new_state.log.push(format!(
+                "{} hit the time limit — auto-move {}",
+                new_state.players[cp].name,
+                move_.as_ref().map(|c| c.join(" ")).unwrap_or_else(|| "pass".to_string())
+            ));
+            self.update_state(&code, new_state.clone());
+            self.broadcast(&code, ServerMsg::State { state: new_state.clone() });
+            self.process_bot_turns_delayed(&code).await;
     }
 
     pub fn rooms_ref(&self) -> Arc<DashMap<String, Room>> {
@@ -704,6 +811,7 @@ impl RoomManager {
         crate::game::rules::skip_finished(&mut state);
         self.update_state(code, state.clone());
         self.broadcast(code, ServerMsg::State { state });
+        self.spawn_turn_watchdog(code);
     }
 }
 

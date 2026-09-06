@@ -290,6 +290,7 @@ impl GameEngine {
                 return events;
             }
             self.resolve_trick(winner, &mut events);
+            self.state.turn_seq += 1;
             if self.state.finished_order.len() >= 3 && self.state.phase != GamePhase::GameOver {
                 self.check_and_end_game(&mut events);
             }
@@ -298,6 +299,7 @@ impl GameEngine {
         } else {
             self.state.current_player = (self.state.current_player + 1) % 4;
             self.skip_finished();
+            self.state.turn_seq += 1;
         }
 
         if self.state.phase != GamePhase::GameOver {
@@ -350,6 +352,7 @@ impl GameEngine {
                     return events;
                 }
                 self.resolve_trick(winner, &mut events);
+                self.state.turn_seq += 1;
                 if self.state.finished_order.len() >= 3
                     && self.state.phase != GamePhase::GameOver
                 {
@@ -361,6 +364,7 @@ impl GameEngine {
         } else {
             self.state.current_player = (self.state.current_player + 1) % 4;
             self.skip_finished();
+            self.state.turn_seq += 1;
         }
 
         if self.state.phase != GamePhase::GameOver {
@@ -534,6 +538,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         }
     }
 
@@ -644,6 +652,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         });
 
         engine.apply_play(0, &["2:diamonds".to_string()]);

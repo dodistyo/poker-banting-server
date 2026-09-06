@@ -40,6 +40,10 @@ fn empty_state() -> GameState {
         total_scores: vec![0],
         three_discard: None,
         log: Vec::new(),
+        play_limit_secs: 10,
+        winning_point: 50,
+        game_winner: None,
+        turn_seq: 0,
     }
 }
 

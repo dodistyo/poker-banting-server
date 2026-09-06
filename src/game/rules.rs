@@ -9,6 +9,74 @@ pub struct ValidationResult {
     pub combo: Option<Combo>,
 }
 
+/// After a round's scoring is baked into `total_scores`, mark the match
+/// winner: the first seat (lowest id on a tie) whose running total reached
+/// the host-set winning point. Set once, never cleared.
+pub fn check_match_winner(state: &mut GameState) {
+    if state.game_winner.is_some() {
+        return;
+    }
+    let winner = state.players.iter().find(|p| {
+        state.total_scores.get(p.id).copied().unwrap_or(0) >= state.winning_point as i32
+    });
+    if let Some(w) = winner {
+        state.game_winner = Some(w.id);
+        state.log.push(format!(
+            "{} reached the winning point ({} pts) — match over!",
+            w.name, state.winning_point
+        ));
+    }
+}
+
+/// Watchdog fallback used when a human ignores the play limit: pick the
+/// lowest single card that is a legal move, or `None` when passing is the
+/// only legal option.
+///
+///   - leading (empty trick): the lowest single in hand
+///   - responding: the lowest single that beats the table
+///   - bomb on the table with no counter: None (pass)
+pub fn idle_auto_move(state: &GameState, player_id: usize) -> Option<Vec<String>> {
+    use super::combo;
+
+    let player = &state.players[player_id];
+    if player.finished || player.hand.is_empty() {
+        return None;
+    }
+
+    let table_combo = if state.trick.combo_player.is_some() {
+        combo::detect_combo(&state.trick.cards)
+    } else {
+        None
+    };
+
+    let mut best: Option<&Card> = None;
+    for c in &player.hand {
+        if !validate_play(std::slice::from_ref(c), table_combo.as_ref()).valid {
+            continue;
+        }
+        best = Some(match best {
+            None => c,
+            Some(b) if c.rank_index() < b.rank_index() => c,
+            Some(b) => b,
+        });
+    }
+    best.map(|c| vec![idle_auto_move::card_id_str(c)])
+}
+
+mod idle_auto_move {
+    use super::*;
+    /// Wire id `rank:suit` matching the server's Play parser (e.g. "9:hearts").
+    pub fn card_id_str(c: &Card) -> String {
+        let suit = match c.suit {
+            super::super::card::Suit::Diamonds => "diamonds",
+            super::super::card::Suit::Clubs => "clubs",
+            super::super::card::Suit::Hearts => "hearts",
+            super::super::card::Suit::Spades => "spades",
+        };
+        format!("{}:{}", c.rank, suit)
+    }
+}
+
 pub fn validate_play(cards: &[Card], table_combo: Option<&Combo>) -> ValidationResult {
     if cards.is_empty() {
         return ValidationResult {
@@ -148,6 +216,7 @@ pub fn finalize_game(state: &mut GameState) -> bool {
             state.total_scores[i] += state.scores[i];
         }
         state.phase = GamePhase::GameOver;
+        check_match_winner(state);
         true
     } else {
         false
@@ -242,6 +311,7 @@ pub fn process_three_discard(state: &mut GameState, player_id: usize) -> bool {
             state.three_discard = None;
             state.phase = GamePhase::Playing;
             state.current_player = first_player;
+            state.turn_seq += 1;
             true
         } else {
             state.current_player = td.order[next_idx];
@@ -334,6 +404,7 @@ pub fn maybe_end_game_by_bomb(state: &mut GameState) -> bool {
         state.total_scores[i] += state.scores[i];
     }
     state.phase = GamePhase::GameOver;
+    check_match_winner(state);
     true
 }
 
@@ -416,6 +487,7 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
                     return false;
                 }
                 resolve_trick(state, winner);
+                state.turn_seq += 1;
                 if end_game(state) {
                     return false;
                 }
@@ -432,6 +504,7 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
                     return false;
                 }
                 resolve_trick(state, winner);
+                state.turn_seq += 1;
                 if end_game(state) {
                     return false;
                 }
@@ -447,6 +520,7 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
 
     state.current_player = (state.current_player + 1) % 4;
     skip_finished(state);
+    state.turn_seq += 1;
     state.players[state.current_player].is_bot && state.phase == GamePhase::Playing
 }
 
@@ -626,6 +700,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
 
         resolve_trick(&mut state, 0);
@@ -653,6 +731,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
 
         assert!(end_game(&mut state));
@@ -678,6 +760,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
 
         assert!(!end_game(&mut state));
@@ -702,6 +788,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
 
         deal_cards(&mut state);
@@ -729,6 +819,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
         assert_eq!(next_player(&state), 1);
     }
@@ -752,6 +846,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
         assert_eq!(next_player(&state), 0);
     }
@@ -775,6 +873,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
 
         // P0 finishes first (+10) — scoring happens when hand empties
@@ -824,6 +926,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
 
         assert_eq!(check_trick_complete(&state), Some(0));
@@ -854,6 +960,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
 
         assert_eq!(check_trick_complete(&state), None);
@@ -884,6 +994,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
 
         assert_eq!(non_participants(&state), 3);

@@ -83,6 +83,32 @@ pub struct GameState {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub three_discard: Option<ThreeDiscardState>,
     pub log: Vec<String>,
+    /// Host-set deadline (seconds) for a HUMAN's turn. Bots are exempt.
+    /// Valid range 1..=120; out-of-range values fall back to the default.
+    #[serde(default = "default_play_limit_secs")]
+    pub play_limit_secs: u32,
+    /// Host-set match target: first player whose `total_scores` reaches this
+    /// at a round end wins the whole game. Range 1..=9999.
+    #[serde(default = "default_winning_point")]
+    pub winning_point: u32,
+    /// Seat id of the match winner, set once and never cleared. While set,
+    /// the room is permanently closed to a new game (game over).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub game_winner: Option<usize>,
+    /// Monotonically increasing turn counter: bumped every time
+    /// `current_player` becomes a new active turn (play/pass/finish).
+    /// The turn watchdog keys off this so a stale timer for an old turn
+    /// can never fire on a new one.
+    #[serde(default)]
+    pub turn_seq: u32,
+}
+
+fn default_play_limit_secs() -> u32 {
+    10
+}
+
+fn default_winning_point() -> u32 {
+    50
 }
 
 fn default_round() -> usize {
@@ -162,6 +188,10 @@ impl Room {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
 
         Room {
@@ -281,6 +311,7 @@ impl Room {
         let prev_winner = self.state.finished_order.first().copied();
 
         self.state.round += 1;
+        self.state.turn_seq += 1;
 
         for p in self.state.players.iter_mut() {
             p.hand.clear();
@@ -562,6 +593,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: GameState = serde_json::from_str(&json).unwrap();

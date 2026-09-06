@@ -5,7 +5,7 @@ const fn default_is_public() -> bool { true }
 
 // Client → Server messages
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ClientMsg {
     #[serde(rename = "create")]
@@ -45,6 +45,14 @@ pub enum ClientMsg {
     },
     #[serde(rename = "startGame")]
     StartGame,
+    /// Host-only: update play limit and/or winning point.
+    #[serde(rename = "setRoomSettings")]
+    SetRoomSettings {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        play_limit_secs: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        winning_point: Option<u32>,
+    },
     #[serde(rename = "leaveRoom")]
     LeaveRoom,
     #[serde(rename = "ping")]
@@ -118,6 +126,12 @@ pub enum ServerMsg {
     },
     #[serde(rename = "gameStarted")]
     GameStarted,
+    /// Echo of room settings after a host update (whole room sees it).
+    #[serde(rename = "roomSettings")]
+    RoomSettings {
+        play_limit_secs: u32,
+        winning_point: u32,
+    },
     #[serde(rename = "error")]
     Error {
         message: String,
@@ -252,6 +266,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
         let msg = ServerMsg::Created {
             code: "ABC123".to_string(),
@@ -290,6 +308,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
         let msg = ServerMsg::State { state };
         let json = serde_json::to_string(&msg).unwrap();
@@ -395,6 +417,10 @@ mod tests {
             total_scores: vec![0],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
         let msg = ServerMsg::Rejoined { player_id: 0, state, code: "ABC123".to_string(), token: "abc123".to_string() };
         let json = personalise_for_viewer(&msg, 0);
@@ -439,6 +465,10 @@ mod tests {
             total_scores: vec![0; 4],
             three_discard: None,
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
         let msg = ServerMsg::Rejoined {
             player_id: 0,
@@ -497,6 +527,10 @@ mod tests {
                 discarded: vec![false; 4],
             }),
             log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
         };
         let json = personalise_for_viewer(&ServerMsg::State { state }, 0);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

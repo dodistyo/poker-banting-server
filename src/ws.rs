@@ -212,6 +212,27 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                     }
                 }
             }
+            ClientMsg::SetRoomSettings { play_limit_secs, winning_point } => {
+                if room_code.is_none() || player_id.is_none() {
+                    continue;
+                }
+                let code = room_code.clone().unwrap();
+                let pid = player_id.unwrap();
+                match rooms.set_room_settings(&code, pid, play_limit_secs, winning_point) {
+                    Ok(server_msg) => {
+                        // Broadcast to the whole room so every client keeps
+                        // play_limit/winning_point in sync.
+                        rooms.broadcast(&code, server_msg);
+                    }
+                    Err(err) => {
+                        let _ = ws_tx.send(Message::Text(
+                            serde_json::to_string(&ServerMsg::Error {
+                                message: err,
+                            }).unwrap().into(),
+                        ));
+                    }
+                }
+            }
             ClientMsg::StartGame => {
                 if room_code.is_none() || player_id.is_none() {
                     continue;
@@ -348,6 +369,9 @@ async fn process_bot_turns_delayed(rooms: &Arc<RoomManager>, code: &str) {
     crate::game::rules::skip_finished(&mut state);
     rooms.update_state(code, state.clone());
     broadcast_state(rooms, code);
+    // Arm the play-limit watchdog if this turn belongs to a human (no-op
+    // for bots / non-Playing phases).
+    rooms.spawn_turn_watchdog(code);
 }
 
 fn broadcast_state(rooms: &Arc<RoomManager>, code: &str) {
