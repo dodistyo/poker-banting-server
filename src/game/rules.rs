@@ -216,6 +216,10 @@ pub fn finalize_game(state: &mut GameState) -> bool {
             state.total_scores[i] += state.scores[i];
         }
         state.phase = GamePhase::GameOver;
+        // The round is over: count it now so the between-rounds waiting room
+        // and the game-over overlay both read the round just finished
+        // ("Round N complete") while the NEXT deal reads N+1.
+        state.round += 1;
         check_match_winner(state);
         true
     } else {
@@ -404,6 +408,8 @@ pub fn maybe_end_game_by_bomb(state: &mut GameState) -> bool {
         state.total_scores[i] += state.scores[i];
     }
     state.phase = GamePhase::GameOver;
+    // Bomb ends the round too — count it at the moment it happens.
+    state.round += 1;
     check_match_winner(state);
     true
 }

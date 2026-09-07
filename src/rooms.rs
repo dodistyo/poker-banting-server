@@ -550,8 +550,11 @@ impl RoomManager {
         if !room.players.iter().any(|p| p.id == player_id && p.is_creator) {
             return Err("Only the host can change room settings".to_string());
         }
-        if room.state.phase != GamePhase::Lobby && room.state.phase != GamePhase::GameOver {
-            return Err("Room settings are locked during play".to_string());
+        if room.started {
+            // Settings are tuned once, at the very beginning of the room
+            // (before the first round starts). After that the room is locked
+            // for good — even in the between-rounds waiting room.
+            return Err("Room settings are locked after the game has started".to_string());
         }
         if play_limit_secs.is_none() && winning_point.is_none() {
             return Err("Nothing to update".to_string());

@@ -310,7 +310,10 @@ impl Room {
     pub fn start_next_round(&mut self) {
         let prev_winner = self.state.finished_order.first().copied();
 
-        self.state.round += 1;
+        // NOTE: `round` is already incremented the moment the previous round
+        // finished (see rules::finalize_game / maybe_end_game_by_bomb), so the
+        // waiting room between rounds shows "Round N+1 Next" immediately.
+        // Do NOT bump it again here — that would skip a round number.
         self.state.turn_seq += 1;
 
         for p in self.state.players.iter_mut() {
@@ -688,20 +691,24 @@ mod tests {
 
     #[test]
     fn test_start_next_round_continues_session() {
+        use crate::game::rules::finalize_game;
         let mut room = Room::new("ABC123".to_string(), "Host".to_string(), "host-token".to_string());
         room.start_game();
         assert_eq!(room.state.round, 1);
         assert!(room.state.three_discard.is_some());
 
-        // Finish round 1: player 0 wins, player 3 loses.
+        // Finish round 1 through the real finalizer: scores are baked into
+        // total_scores, phase flips to GameOver, and the round counter bumps
+        // to 2 the moment the round ends.
         room.state.scores = vec![10, 5, 0, -15];
-        room.state.finished_order = vec![0, 1, 2, 3];
-        room.state.phase = GamePhase::GameOver;
-        room.state.ensure_total_scores();
+        room.state.finished_order = vec![0, 1, 2];
         for i in 0..4 {
-            room.state.total_scores[i] += room.state.scores[i];
             room.state.players[i].finished = true;
         }
+        assert!(finalize_game(&mut room.state));
+        assert_eq!(room.state.round, 2);
+        assert_eq!(room.state.phase, GamePhase::GameOver);
+        assert_eq!(room.state.total_scores, vec![10, 5, 0, -15]);
 
         // Continue the session (creator presses Start Game again).
         room.start_game();
@@ -746,19 +753,19 @@ mod tests {
         let (code, pid, _msg, _s) = mgr.create_room("Host".to_string(), true);
         let (_, _spawn) = mgr.start_game(&code, pid).unwrap();
 
-        // Finish round 1 so the room sits in GameOver.
+        // Finish round 1 so the room sits in GameOver. The realizer does the
+        // total-score accumulation AND the round bump (round 1 -> 2).
         {
             let map = mgr.rooms_ref();
             let mut entry = map.get_mut(&code).unwrap();
             let room: &mut Room = &mut *entry;
             room.state.scores = vec![10, 5, 0, -15];
-            room.state.finished_order = vec![0, 1, 2, 3];
-            room.state.phase = GamePhase::GameOver;
-            room.state.ensure_total_scores();
-            for i in 0..4 {
-                room.state.total_scores[i] += room.state.scores[i];
+            room.state.finished_order = vec![0, 1, 2];
+            for i in 0..3 {
                 room.state.players[i].finished = true;
             }
+            assert!(crate::game::rules::finalize_game(&mut room.state));
+            assert_eq!(room.state.round, 2);
         }
 
         // Creator starts again: round 2, no 3-discard, cumulative scores kept.

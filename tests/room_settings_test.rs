@@ -130,18 +130,28 @@ fn test_set_room_settings_clamps_and_requires_value() {
 }
 
 #[test]
-fn test_set_room_settings_only_in_lobby_or_gameover() {
+fn test_set_room_settings_only_before_first_round() {
     let manager = RoomManager::new(6, 2500, 30, 15);
-    let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+    let (code, pid, _, _) = manager.create_room("Alice".to_string(), true);
 
-    // Works in Lobby.
-    manager.set_room_settings(&code, 0, Some(7), None).unwrap();
+    // Works in a fresh Lobby (before the first round has started).
+    manager.set_room_settings(&code, pid, Some(7), None).unwrap();
 
-    // Not mid-round.
-    let mut st = manager.get_state(&code).unwrap();
-    st.phase = GamePhase::Playing;
-    manager.update_state(&code, st);
-    assert!(manager.set_room_settings(&code, 0, Some(7), None).is_err());
+    // Start the first round, then simulate it ending (waiting room between
+    // rounds). Settings must now be locked for good — the host only tunes
+    // them at the very beginning of the room.
+    manager.start_game(&code, pid).unwrap();
+    {
+        let map = manager.rooms_ref();
+        let mut entry = map.get_mut(&code).unwrap();
+        entry.state.phase = GamePhase::GameOver;
+    }
+
+    let err = manager.set_room_settings(&code, pid, Some(7), None).unwrap_err();
+    assert!(
+        err.contains("locked"),
+        "settings must be locked after the first round, got: {err}"
+    );
 }
 
 // ─── s3: watchdog auto-move ───
@@ -200,7 +210,11 @@ async fn test_watchdog_auto_moves_stalled_human() {
     manager.process_three_discard_delayed(&code).await;
 
     let start_hand = manager.get_state(&code).unwrap().players[0].hand.len();
-    assert_eq!(start_hand, 13);
+    // The auto three-discard already ran above, so the human starts the
+    // round with 13 minus however many 3s they were dealt (0..=4). The
+    // watchdog logic below is relative to this baseline, so only sanity-
+    // bound it — a hard ==13 here made the test shuffle-dependent.
+    assert!((9..=13).contains(&start_hand), "unexpected hand size {start_hand}");
 
     // No human input. Poll until the watchdog auto-moves the human or 8s
     // pass (fail).
@@ -346,4 +360,60 @@ fn test_set_room_settings_message_wire_format() {
     assert_eq!(v["type"], "roomSettings");
     assert_eq!(v["playLimitSecs"], 15);
     assert_eq!(v["winningPoint"], 60);
+}
+
+// ─── Round counting: the counter advances the moment a round finishes ───
+
+#[test]
+fn test_finalize_game_increments_round() {
+    let mut s = empty_state();
+    assert_eq!(s.round, 1);
+    s.total_scores = vec![40, 10, 5, 0];
+    s.players[0].finished = true;
+    s.finished_order.push(0);
+    s.scores[0] = 10;
+    s.players[1].finished = true;
+    s.finished_order.push(1);
+    s.scores[1] = 5;
+    s.players[2].finished = true;
+    s.finished_order.push(2);
+    s.scores[2] = 0;
+
+    let ended = finalize_game(&mut s);
+    assert!(ended);
+    assert_eq!(s.phase, GamePhase::GameOver);
+    // The round just finished: the counter must already read the NEXT round
+    // so the waiting room ("Round N complete") and the game-over overlay
+    // agree on which round we are about to play.
+    assert_eq!(s.round, 2, "finalize_game must bump round on round end");
+
+    // Idempotency: a second call must not bump again.
+    assert!(!finalize_game(&mut s));
+    assert_eq!(s.round, 2);
+}
+
+#[test]
+fn test_bomb_endgame_increments_round() {
+    let mut s = empty_state();
+    assert_eq!(s.round, 1);
+    s.total_scores = vec![0, 40, 5, 0];
+    s.players[0].hand = vec![card(Rank::Three, Suit::Spades)];
+    s.players[1].hand = vec![card(Rank::Four, Suit::Spades)];
+    s.players[2].hand = vec![card(Rank::Five, Suit::Spades)];
+    s.players[3].hand = vec![card(Rank::Six, Suit::Spades)];
+    s.trick.cards = vec![
+        card(Rank::King, Suit::Spades),
+        card(Rank::King, Suit::Hearts),
+        card(Rank::King, Suit::Diamonds),
+        card(Rank::King, Suit::Clubs),
+    ];
+    s.trick.combo_type = Some(ComboType::Bomb);
+    s.trick.combo_player = Some(1);
+    s.trick.played = vec![0];
+    s.trick.passed = vec![2, 3, 0];
+
+    let ended = maybe_end_game_by_bomb(&mut s);
+    assert!(ended);
+    assert_eq!(s.phase, GamePhase::GameOver);
+    assert_eq!(s.round, 2, "bomb endgame must bump round on round end");
 }
