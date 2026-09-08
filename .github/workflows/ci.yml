@@ -51,8 +51,8 @@ jobs:
           create_credentials_file: true
           export_environment_variables: true
 
-      - name: Install gcloud
-        uses: google-github-actions/get-gcloud-sdk@v2
+      - name: Install gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Build & push image to Artifact Registry
         run: |
