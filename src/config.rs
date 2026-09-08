@@ -11,14 +11,33 @@ pub struct Config {
     pub room_orphan_timeout_secs: u64,
   }
 
+/// Resolve the bind port with Cloud Run in mind.
+///
+/// Cloud Run injects `$PORT` (the port the ingress container must listen on).
+/// It does NOT set `SERVER_PORT`. So the precedence is:
+///   1. `SERVER_PORT` — explicit override for local dev / tests,
+///   2. `PORT`        — Cloud Run's injected port,
+///   3. `8080`        — sane default.
+///
+/// Takes `Option<&str>` for each so the precedence is a pure, testable
+/// function (no process-global env mutation in tests).
+fn resolve_port(server_port: Option<&str>, port: Option<&str>) -> u16 {
+    for v in [server_port, port].into_iter().flatten() {
+        if let Ok(p) = v.trim().parse::<u16>() {
+            return p;
+        }
+    }
+    8080
+}
+
 impl Config {
     pub fn new() -> Self {
         Config {
             host: env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
-            port: env::var("SERVER_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8080),
+            port: resolve_port(
+                env::var("SERVER_PORT").ok().as_deref(),
+                env::var("PORT").ok().as_deref(),
+            ),
             room_code_length: env::var("ROOM_CODE_LENGTH")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -50,6 +69,31 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- resolve_port: Cloud Run injects $PORT (NOT SERVER_PORT). Precedence:
+    // SERVER_PORT (explicit dev override) > PORT (Cloud Run) > 8080. ---
+    #[test]
+    fn test_resolve_port_default_when_no_env() {
+        assert_eq!(resolve_port(None, None), 8080);
+    }
+
+    #[test]
+    fn test_resolve_port_cloud_run_port() {
+        assert_eq!(resolve_port(None, Some("8080".into())), 8080);
+        assert_eq!(resolve_port(None, Some("12345".into())), 12345);
+    }
+
+    #[test]
+    fn test_resolve_port_server_port_wins_over_port() {
+        assert_eq!(resolve_port(Some("9000".into()), Some("12345".into())), 9000);
+    }
+
+    #[test]
+    fn test_resolve_port_invalid_values_fall_back() {
+        assert_eq!(resolve_port(Some("not-a-number".into()), Some("8080".into())), 8080);
+        assert_eq!(resolve_port(Some("not-a-number".into()), None), 8080);
+        assert_eq!(resolve_port(None, Some("abc".into())), 8080);
+    }
 
     #[test]
     fn test_config_defaults() {
