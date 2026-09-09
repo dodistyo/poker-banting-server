@@ -1,79 +1,100 @@
 #!/usr/bin/env python3
-"""TEMPORARY debug: perform the EXACT STS exchange google-github-actions/auth
-does (camelCase JSON body, requestedTokenType=access_token), then decode the
-returned WIF principal JWT and print every claim — including the real subject
-and the repository attribute. Delete with debug-wif.yml after the IAM
-bindings are pinned correctly."""
-import base64, json, os, sys, urllib.request, urllib.error
+"""TEMPORARY debug (one-shot):
+1. Mint the real GitHub ID token via the RUNNER's own endpoint vars
+   (ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN) — no more guessing URLs.
+2. Print its sub claim verbatim.
+3. Perform the official STS exchange (camelCase, full provider audience).
+4. Decode the minted WIF principal JWT -> its exact subject + attribute.repository.
+5. Try getAccessToken on the SA as the WIF principal -> the real impersonation test.
+Delete with debug-wif.yml when CI is green.
+"""
+import base64, json, os, sys, urllib.request, urllib.error, urllib.parse
 
-AUD = "//iam.googleapis.com/projects/153176493081/locations/global/workloadIdentityPools/pocerbanting/providers/github"
-job_token = os.environ["GHA_ID_TOKEN"]
-
-# 0) The github.token is a job runner token (aud: authnd). The official action
-#    first exchanges it for a real OIDC ID token. Do the same.
-oidc_req = urllib.request.Request(
-    "https://token.actions.githubusercontent.com?audience=authnd",
-    headers={"Authorization": f"bearer {job_token}", "Accept": "application/json; api-version=1.0"},
-)
-with urllib.request.urlopen(oidc_req, timeout=30) as r:
-    token = json.loads(r.read().decode())["value"]
+NUM = "153176493081"
+POOL = "pocerbanting"
+AUD = f"//iam.googleapis.com/projects/{NUM}/locations/global/workloadIdentityPools/{POOL}/providers/github"
+SA = "pocerbanting-ci@clear-region-377216.iam.gserviceaccount.com"
 
 
 def b64url_decode(seg):
-    pad = "=" * (-len(seg) % 4)
-    return base64.urlsafe_b64decode(seg + pad)
+    return base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4))
 
 
-def decode_jwt(jwt):
-    h, p, s = jwt.split(".")
-    hdr = json.loads(b64url_decode(h))
-    payload = json.loads(b64url_decode(p))
-    return hdr, payload
+def jwt_payload(jwt):
+    return json.loads(b64url_decode(jwt.split(".")[1]))
 
 
-# 1) GitHub OIDC token claims (the subject_token)
-h, p, s = token.split(".")
-print("=== GITHUB OIDC TOKEN (subject_token) claims ===")
-for k, v in json.loads(b64url_decode(p)).items():
-    if k in ("sub", "repository", "repository_owner", "ref", "iss", "aud"):
-        print(f"  {k}: {v}")
+def post_json(url, body, headers=None):
+    h = {"Content-Type": "application/json"}
+    h.update(headers or {})
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=h, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
 
-# 2) Faithful STS exchange — identical body to wif.ts lines 166-173
+
+# 1) real ID token from the runner's own endpoint
+req_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+req_tok = os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+if "audience" not in req_url:
+    req_url += "&audience=" + AUD
+else:
+    req_url = req_url.split("audience=")[0] + "audience=" + AUD
+oidc_req = urllib.request.Request(
+    req_url,
+    headers={"Authorization": f"bearer {req_tok}", "Accept": "application/json; api-version=1.0"},
+)
+try:
+    with urllib.request.urlopen(oidc_req, timeout=30) as r:
+        id_token = json.loads(r.read().decode())["value"]
+except Exception as e:
+    print(f"FATAL: could not mint ID token: {e}")
+    sys.exit(1)
+
+p = jwt_payload(id_token)
+print("=== GITHUB ID TOKEN claims (the assertion STS validates) ===")
+for k in ("iss", "sub", "aud", "repository", "repository_owner", "ref", "ref_type", "event_name"):
+    print(f"  {k}: {p.get(k)}")
+
+# 2) official STS exchange (identical body to google-github-actions/auth wif.ts)
 body = {
     "audience": AUD,
     "grantType": "urn:ietf:params:oauth:grant-type:token-exchange",
     "requestedTokenType": "urn:ietf:params:oauth:token-type:access_token",
     "scope": "https://www.googleapis.com/auth/cloud-platform",
     "subjectTokenType": "urn:ietf:params:oauth:token-type:jwt",
-    "subjectToken": token,
+    "subjectToken": id_token,
 }
-req = urllib.request.Request(
-    "https://sts.googleapis.com/v1/token",
-    data=json.dumps(body).encode(),
-    headers={"Content-Type": "application/json"},
-    method="POST",
-)
-try:
-    with urllib.request.urlopen(req, timeout=30) as r:
-        resp = json.loads(r.read().decode())
-except urllib.error.HTTPError as e:
-    print(f"=== STS ERROR: HTTP {e.code} ===")
-    print(e.read().decode()[:500])
+status, resp = post_json("https://sts.googleapis.com/v1/token", body)
+if status >= 300:
+    print(f"=== STS ERROR: HTTP {status} ===")
+    print(json.dumps(resp, indent=1)[:800])
     sys.exit(1)
 
-principal = resp.get("access_token", "")
-print("\n=== WIF PRINCIPAL TOKEN (decoded JWT) — THE REAL SUBJECT ===")
+principal = resp["access_token"]
+print("\n=== MINTED WIF PRINCIPAL (decoded) ===")
 try:
-    hdr, payload = decode_jwt(principal)
-    for k, v in payload.items():
+    cp = jwt_payload(principal)
+    for k, v in cp.items():
         print(f"  {k}: {v}")
-    print("\n>>> REAL SUBJECT TO USE IN IAM BINDINGS:")
-    print(f"    principal://iam.googleapis.com/projects/153176493081/"
-          f"locations/global/workloadIdentityPools/pocerbanting/subject/{payload.get('sub')}")
-    attrs = payload.get("attribute", {})
-    if attrs:
-        print(f">>> principalSet option (attribute.repository):")
-        print(f"    principalSet://iam.googleapis.com/projects/153176493081/"
-              f"locations/global/workloadIdentityPools/pocerbanting/attribute.repository/{attrs.get('repository')}")
+    print("\n>>> EXACT PRINCIPAL TO BIND:")
+    print(f"    principal://iam.googleapis.com/projects/{NUM}/locations/global/"
+          f"workloadIdentityPools/{POOL}/subject/{cp.get('sub')}")
+    repo = (cp.get("attribute") or {}).get("repository")
+    print(f">>> attribute.repository = {repo!r}")
 except Exception as ex:
-    print("  (not a JWT, or decode failed):", repr(principal[:200]))
+    print("  (decode failed)", ex)
+    sys.exit(1)
+
+# 3) REAL impersonation test: getAccessToken as the WIF principal
+url = f"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{SA}:generateAccessToken"
+status2, resp2 = post_json(url, {"scope": ["cloud-platform"]},
+                           headers={"Authorization": f"Bearer {principal}"})
+print(f"\n=== GETACCTOKEN AS WIF PRINCIPAL: HTTP {status2} ===")
+if status2 < 300:
+    print("  IMPERSONATION WORKS. token len:", len(resp2.get("accessToken", "")))
+else:
+    msg = (resp2.get("error") or {}).get("message", json.dumps(resp2)[:400])
+    print("  STILL DENIED:", msg[:500])
