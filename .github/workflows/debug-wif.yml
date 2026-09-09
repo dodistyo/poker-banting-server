@@ -1,0 +1,19 @@
+name: debug-wif
+# TEMPORARY: performs the exact STS exchange google-github-actions/auth does and
+# decodes the minted WIF principal JWT, printing its real subject + attributes.
+# DELETE once CI deploys are green.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decode minted WIF principal subject
+        env:
+          GHA_ID_TOKEN: ${{ github.token }}
+        run: python3 scripts/debug_wif.py
