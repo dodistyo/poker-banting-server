@@ -20,7 +20,8 @@ jobs:
             -d "subject_token=${{ github.token }}" \
             -d "subject_token_type=urn:ietf:params:oauth:token-type:id_token" \
             -d "audience=//iam.googleapis.com/projects/153176493081/locations/global/workloadIdentityPools/pocerbanting/providers/github" \
-            -d "requestedTokenFormat=urn:ietf:params:oauth:token-type:access_token" > /tmp/sts.json
+            -d "scope=openid" \
+            -d "requested_token_type=urn:ietf:params:oauth:token-type:jwt" > /tmp/sts.json
           cat /tmp/sts.json | head -c 200; echo ""
           python3 /dev/stdin <<'PYEOF'
           import json, base64, sys
