@@ -12,7 +12,7 @@ job_token = os.environ["GHA_ID_TOKEN"]
 # 0) The github.token is a job runner token (aud: authnd). The official action
 #    first exchanges it for a real OIDC ID token. Do the same.
 oidc_req = urllib.request.Request(
-    "https://token.actions.githubusercontent.com?audience=sigma://google.com",
+    "https://token.actions.githubusercontent.com?audience=authnd",
     headers={"Authorization": f"bearer {job_token}", "Accept": "application/json; api-version=1.0"},
 )
 with urllib.request.urlopen(oidc_req, timeout=30) as r:
