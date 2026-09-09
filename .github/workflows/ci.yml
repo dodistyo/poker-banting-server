@@ -39,15 +39,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Keyless auth: GitHub OIDC -> WIF -> service account. No keys, no
-      # secrets. SA needs roles/artifactregistry.writer + roles/run.admin
-      # (both granted on the project).
+      # Keyless auth: GitHub OIDC -> WIF. NO `service_account` set on purpose:
+      # the WIF principal itself holds run.admin / artifactregistry.writer /
+      # logging.logWriter at project level, so acting as the WIF identity
+      # DIRECTLY avoids an SA-impersonation hop (which would additionally
+      # require iam.serviceAccountTokenCreator on the SA resource).
       - name: Authenticate to Google Cloud (WIF)
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: >-
             projects/153176493081/locations/global/workloadIdentityPools/pocerbanting/providers/github
-          service_account: pocerbanting-ci@clear-region-377216.iam.gserviceaccount.com
           create_credentials_file: true
           export_environment_variables: true
 
@@ -56,15 +57,15 @@ jobs:
 
       - name: Build & push image to Artifact Registry
         run: |
-          IMAGE=asia-docker.pkg.dev/clear-region-377216/poker-banting/pocer-server:${GITHUB_SHA}
-          gcloud auth configure-docker asia-docker.pkg.dev
+          IMAGE=asia-southeast1-docker.pkg.dev/clear-region-377216/poker-banting/pocer-server:${GITHUB_SHA}
+          gcloud auth configure-docker asia-southeast1-docker.pkg.dev
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
 
       - name: Deploy to Cloud Run (asia-southeast1)
         run: |
           gcloud run deploy poker-banting \
-            --image "asia-docker.pkg.dev/clear-region-377216/poker-banting/pocer-server:${GITHUB_SHA}" \
+            --image "asia-southeast1-docker.pkg.dev/clear-region-377216/poker-banting/pocer-server:${GITHUB_SHA}" \
             --region asia-southeast1 \
             --project clear-region-377216 \
             --platform managed \
