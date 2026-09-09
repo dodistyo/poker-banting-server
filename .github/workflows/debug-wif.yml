@@ -1,0 +1,38 @@
+name: debug-wif
+# TEMPORARY: performs the same STS token-exchange as google-github-actions/auth
+# and prints the decoded WIF principal token, revealing the EXACT subject claim.
+# Delete after the IAM bindings are fixed.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  wif-subject:
+    runs-on: ubuntu-latest
+    steps:
+      - name: STS exchange + decode WIF principal token
+        run: |
+          curl -s -X POST https://sts.googleapis.com/v1/token \
+            -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            -d "subject_token=${{ github.token }}" \
+            -d "subject_token_type=urn:ietf:params:oauth:token-type:id_token" \
+            -d "audience=//iam.googleapis.com/projects/153176493081/locations/global/workloadIdentityPools/pocerbanting/providers/github" \
+            -d "requestedTokenFormat=urn:ietf:params:oauth:token-type:access_token" > /tmp/sts.json
+          cat /tmp/sts.json | head -c 200; echo ""
+          python3 /dev/stdin <<'PYEOF'
+          import json, base64, sys
+          d = json.load(open('/tmp/sts.json'))
+          if 'error' in d:
+              print("STS ERROR:", json.dumps(d))
+              sys.exit(0)
+          t = d.get('access_token','')
+          parts = t.split('.')
+          pad = parts[1] + '=' * (-len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          print("===== WIF PRINCIPAL TOKEN CLAIMS =====")
+          for k in sorted(claims):
+              print(f"  {k}: {claims[k]}")
+          PYEOF
