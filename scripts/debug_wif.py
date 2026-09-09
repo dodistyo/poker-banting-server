@@ -6,7 +6,7 @@ and the repository attribute. Delete with debug-wif.yml after the IAM
 bindings are pinned correctly."""
 import base64, json, os, sys, urllib.request, urllib.error
 
-AUD = "iam.googleapis.com"
+AUD = "//iam.googleapis.com/projects/153176493081/locations/global/workloadIdentityPools/pocerbanting/providers/github"
 token = os.environ["GHA_ID_TOKEN"]
 
 
