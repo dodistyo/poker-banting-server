@@ -64,16 +64,28 @@ jobs:
 
       - name: Deploy to Cloud Run (asia-southeast1)
         run: |
-          # Scaling contract (see /TECH-DEBT-SCALING.md):
-          #   --concurrency 1000 : WS connections are long-lived; default 80
-          #                        would cap the server at 80 CCU.
+          # Scaling contract (see poker-banting-server/docs/CAPACITY.md):
+          #   --concurrency 1000 : WS connections are long-lived (1 WS = 1
+          #                        in-flight request); Cloud Run hard caps
+          #                        this at 1000/instance. Default 80 would
+          #                        cap the server at 80 CCU.
           #   --timeout 3600     : a WS connection = 1 request; 300s would kill
           #                        every game longer than 5 minutes.
-          #   --max 1            : state is in-process (DashMap); 2+ instances
-          #                        = split brain until Option B (Redis).
-          #                        PITFALL: the long flag `--max-instances` is
-          #                        SILENTLY IGNORED by gcloud (verified 568.0.0)
-          #                        — only the short `--max` persists.
+          #   --max 3            : 3 x 1000 = 3000 CCU ceiling. Multi-pod is
+          #                        safe now (Opsi B: Redis + pub/sub +
+          #                        stateless room driver). PITFALL: the long
+          #                        flag `--max-instances` is SILENTLY IGNORED
+          #                        by gcloud (verified 568.0.0) — only the
+          #                        short `--max` persists.
+          #   --cpu 0.5 --memory 512Mi : 512Mi is the Cloud Run minimum memory;
+          #                        0.5 vCPU verified enough (1000 active =
+          #                        ~20% CPU on 1 vCPU; RAM ~80% at 2500).
+          # ENV STORAGE/REDIS_URL: NOT set here on purpose — they live in the
+          # service config, set manually via:
+          #   gcloud run services update poker-banting \
+          #     --region asia-southeast1 \
+          #     --update-env STORAGE=redis,REDIS_URL=rediss://...
+          # (a plain deploy without --update-env/--clear-env preserves them).
           gcloud run deploy poker-banting \
             --image "asia-southeast1-docker.pkg.dev/clear-region-377216/poker-banting/pocer-server:${GITHUB_SHA}" \
             --region asia-southeast1 \
@@ -82,7 +94,9 @@ jobs:
             --allow-unauthenticated \
             --concurrency 1000 \
             --timeout 3600s \
-            --max 1
+            --cpu 0.5 \
+            --memory 512Mi \
+            --max 3
           echo "Service URL: https://$(gcloud run services describe poker-banting \
             --region asia-southeast1 --project clear-region-377216 \
-            --format='value(status.url)')"
+            --format='value(status.url)')'

@@ -6,8 +6,6 @@ use futures_util::{StreamExt, SinkExt};
 use std::sync::Arc;
 use crate::protocol::{ClientMsg, ServerMsg};
 use crate::rooms::RoomManager;
-use crate::game::rules::process_one_bot_turn;
-use crate::game::state::GamePhase;
 
 fn spawn_broadcast_forwarder(ws_tx: tokio::sync::mpsc::UnboundedSender<Message>, mut rx: tokio::sync::mpsc::UnboundedReceiver<Message>) {
     let fwd_tx = ws_tx.clone();
@@ -44,7 +42,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
             Ok(Message::Binary(_)) => continue,
             Ok(Message::Close(_)) => {
                 if let (Some(code), Some(pid)) = (&room_code, player_id) {
-                    rooms.leave_room(code, pid);
+                    rooms.leave_room(code, pid).await;
                 }
                 cleaned_up = true;
                 break;
@@ -52,7 +50,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
             Ok(_) => continue,
             Err(_) => {
                 if let (Some(code), Some(pid)) = (&room_code, player_id) {
-                    rooms.leave_room(code, pid);
+                    rooms.leave_room(code, pid).await;
                 }
                 cleaned_up = true;
                 break;
@@ -73,8 +71,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
 
         match client_msg {
             ClientMsg::Create { name, is_public } => {
-
-                let (code, pid, server_msg, should_spawn) = rooms.create_room(name, is_public);
+                let (code, pid, server_msg) = rooms.create_room(name, is_public).await;
                 room_code = Some(code.clone());
                 player_id = Some(pid);
 
@@ -88,20 +85,11 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 rooms.add_session(code.clone(), pid, session);
 
                 spawn_broadcast_forwarder(ws_tx.clone(), rx);
-
-                if should_spawn {
-                    let rooms_clone = rooms.clone();
-                    let code_clone = code.clone();
-                    tokio::spawn(async move {
-                        rooms_clone.process_three_discard_delayed(&code_clone).await;
-                    });
-                }
             }
             ClientMsg::Join { code, name } => {
-
-                match rooms.join_room(&code, name) {
-                    Ok((server_msg, should_spawn)) => {
-                        let join_code = code.clone();
+                match rooms.join_room(&code, name).await {
+                    Ok(server_msg) => {
+                        let join_code = code.to_uppercase();
                         room_code = Some(join_code.clone());
                         if let ServerMsg::Joined { player_id: pid, .. } = &server_msg {
                             player_id = Some(*pid);
@@ -116,14 +104,6 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                         rooms.add_session(join_code.clone(), player_id.unwrap_or(0), session);
 
                         spawn_broadcast_forwarder(ws_tx.clone(), rx);
-
-                        if should_spawn {
-                            let rooms_clone = rooms.clone();
-                            let join_code_clone = join_code.clone();
-                            tokio::spawn(async move {
-                                rooms_clone.process_three_discard_delayed(&join_code_clone).await;
-                            });
-                        }
                     }
                     Err(err) => {
                         let _ = ws_tx.send(Message::Text(
@@ -142,7 +122,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 let pid = player_id.unwrap();
                 let rooms_clone = rooms.clone();
                 tokio::spawn(async move {
-                    handle_play(&rooms_clone, &code, pid, cards).await;
+                    let _ = rooms_clone.apply_human_move(&code, pid, Some(cards)).await;
                 });
             }
             ClientMsg::Pass => {
@@ -153,14 +133,13 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 let pid = player_id.unwrap();
                 let rooms_clone = rooms.clone();
                 tokio::spawn(async move {
-                    handle_pass(&rooms_clone, &code, pid).await;
+                    let _ = rooms_clone.apply_human_move(&code, pid, None).await;
                 });
             }
             ClientMsg::Rejoin { code, name, token } => {
-
-                match rooms.rejoin_room(&code, &name, &token) {
-                    Ok((server_msg, _)) => {
-                        let rejoin_code = code.clone();
+                match rooms.rejoin_room(&code, &name, &token).await {
+                    Ok(server_msg) => {
+                        let rejoin_code = code.to_uppercase();
                         room_code = Some(rejoin_code.clone());
                         if let ServerMsg::Rejoined { player_id: pid, .. } = &server_msg {
                             player_id = Some(*pid);
@@ -176,7 +155,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
 
                         spawn_broadcast_forwarder(ws_tx.clone(), rx);
                     }
-            Err(err) => {
+                    Err(err) => {
                         // Forward the specific reason: "Seat already in use by
                         // another window" (second tab holds the seat) needs a
                         // different client reaction than a genuinely gone
@@ -196,12 +175,14 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 }
                 let code = room_code.clone().unwrap();
                 let pid = player_id.unwrap();
-                match rooms.ready_player(&code, pid, ready) {
+                match rooms.ready_player(&code, pid, ready).await {
                     Ok(server_msg) => {
-                        // Broadcast to the WHOLE room, not just the toggle
-                        // sender — otherwise the room creator (and everyone
-                        // else) never sees the status flip.
-                        rooms.broadcast(&code, server_msg);
+                        // The manager already broadcast PlayerReady to the
+                        // whole room (local + other pods); reply only to the
+                        // toggler.
+                        let _ = ws_tx.send(Message::Text(
+                            serde_json::to_string(&server_msg).unwrap().into(),
+                        ));
                     }
                     Err(err) => {
                         let _ = ws_tx.send(Message::Text(
@@ -218,11 +199,14 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 }
                 let code = room_code.clone().unwrap();
                 let pid = player_id.unwrap();
-                match rooms.set_room_settings(&code, pid, play_limit_secs, winning_point) {
+                match rooms.set_room_settings(&code, pid, play_limit_secs, winning_point).await {
                     Ok(server_msg) => {
-                        // Broadcast to the whole room so every client keeps
-                        // play_limit/winning_point in sync.
-                        rooms.broadcast(&code, server_msg);
+                        // The manager already broadcast RoomSettings to the
+                        // whole room so every client stays in sync; reply only
+                        // to the host.
+                        let _ = ws_tx.send(Message::Text(
+                            serde_json::to_string(&server_msg).unwrap().into(),
+                        ));
                     }
                     Err(err) => {
                         let _ = ws_tx.send(Message::Text(
@@ -239,18 +223,14 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
                 }
                 let code = room_code.clone().unwrap();
                 let pid = player_id.unwrap();
-                match rooms.start_game(&code, pid) {
-                    Ok((server_msg, should_spawn)) => {
+                match rooms.start_game(&code, pid).await {
+                    Ok(server_msg) => {
+                        // GameStarted + State were already broadcast by the
+                        // manager; the host's own reply carries the (masked)
+                        // state for the start screen.
                         let _ = ws_tx.send(Message::Text(
                             crate::protocol::personalise_for_viewer(&server_msg, pid).into(),
                         ));
-                        if should_spawn {
-                            let rooms_clone = rooms.clone();
-                            let code_clone = code.clone();
-                            tokio::spawn(async move {
-                                rooms_clone.process_three_discard_delayed(&code_clone).await;
-                            });
-                        }
                     }
                     Err(err) => {
                         let _ = ws_tx.send(Message::Text(
@@ -263,7 +243,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
             }
             ClientMsg::LeaveRoom => {
                 if let (Some(code), Some(pid)) = (&room_code, player_id) {
-                    if let Some(msg) = rooms.remove_player(&code, pid) {
+                    if let Some(msg) = rooms.remove_player(&code, pid).await {
                         let _ = ws_tx.send(Message::Text(
                             serde_json::to_string(&msg).unwrap().into(),
                         ));
@@ -275,7 +255,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
             ClientMsg::CheckRoom { code, token } => {
                 // Read-only: no seat is touched, so the user can still click
                 // the (still visible) Rejoin item right afterwards.
-                let (found, rejoinable) = rooms.check_room(&code, &token);
+                let (found, rejoinable) = rooms.check_room(&code, &token).await;
                 let _ = ws_tx.send(Message::Text(
                     serde_json::to_string(&ServerMsg::RoomStatus {
                         code: code.to_uppercase(),
@@ -294,7 +274,7 @@ async fn handle_ws(socket: WebSocket, rooms: Arc<RoomManager>) {
 
     if !cleaned_up {
         if let (Some(code), Some(pid)) = (&room_code, player_id) {
-            rooms.leave_room(code, pid);
+            rooms.leave_room(code, pid).await;
         }
     }
     if let (Some(code), Some(tx)) = (&room_code, &session_tx) {
@@ -307,75 +287,5 @@ async fn write_forward(mut write: impl futures_util::Sink<Message> + Unpin, mut 
         if write.send(msg).await.is_err() {
             break;
         }
-    }
-}
-
-async fn handle_play(
-    rooms: &Arc<RoomManager>,
-    code: &str,
-    player_id: usize,
-    card_ids: Vec<String>,
-) {
-    tokio::task::yield_now().await;
-    let state = match rooms.get_state(code) {
-        Some(s) => s,
-        None => return,
-    };
-
-    let mut engine = crate::game::engine::GameEngine::new(state);
-    engine.apply_play(player_id, &card_ids);
-    rooms.update_state(code, engine.state().clone());
-    broadcast_state(rooms, code);
-    process_bot_turns_delayed(rooms, code).await;
-}
-
-async fn handle_pass(
-    rooms: &Arc<RoomManager>,
-    code: &str,
-    player_id: usize,
-) {
-    tokio::task::yield_now().await;
-    let state = match rooms.get_state(code) {
-        Some(s) => s,
-        None => return,
-    };
-
-    let mut engine = crate::game::engine::GameEngine::new(state);
-    engine.apply_pass(player_id);
-    rooms.update_state(code, engine.state().clone());
-    broadcast_state(rooms, code);
-    process_bot_turns_delayed(rooms, code).await;
-}
-
-async fn process_bot_turns_delayed(rooms: &Arc<RoomManager>, code: &str) {
-    loop {
-        let mut state = match rooms.get_state(code) {
-            Some(s) if s.phase == GamePhase::Playing => s,
-            _ => return,
-        };
-        let needs_more = process_one_bot_turn(&mut state);
-        rooms.update_state(code, state.clone());
-        broadcast_state(rooms, code);
-        if !needs_more {
-            break;
-        }
-        let delay_ms = rooms.get_bot_turn_delay_ms();
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-    }
-    let mut state = match rooms.get_state(code) {
-        Some(s) if s.phase == GamePhase::Playing => s,
-        _ => return,
-    };
-    crate::game::rules::skip_finished(&mut state);
-    rooms.update_state(code, state.clone());
-    broadcast_state(rooms, code);
-    // Arm the play-limit watchdog if this turn belongs to a human (no-op
-    // for bots / non-Playing phases).
-    rooms.spawn_turn_watchdog(code);
-}
-
-fn broadcast_state(rooms: &Arc<RoomManager>, code: &str) {
-    if let Some(state) = rooms.get_state(code) {
-        rooms.broadcast(code, ServerMsg::State { state });
     }
 }

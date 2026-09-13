@@ -420,7 +420,12 @@ impl GameEngine {
     }
 
     fn skip_finished(&mut self) {
-        while self.state.players[self.state.current_player].finished {
+        // Bounded — see rules::skip_finished: an unbounded while-loop here
+        // spun a tokio worker at 100% CPU when all 4 players are finished.
+        for _ in 0..4 {
+            if !self.state.players[self.state.current_player].finished {
+                return;
+            }
             self.state.current_player = (self.state.current_player + 1) % 4;
         }
     }

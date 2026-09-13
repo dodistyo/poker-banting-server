@@ -61,7 +61,7 @@ pub enum ClientMsg {
 
 // Server → Client messages
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ServerMsg {
     #[serde(rename = "created")]

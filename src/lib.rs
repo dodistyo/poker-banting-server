@@ -13,7 +13,9 @@ use crate::rooms::RoomManager;
 pub mod config;
 pub mod game;
 pub mod protocol;
+pub mod pubsub;
 pub mod rooms;
+pub mod store;
 pub mod ws;
 
 #[derive(serde::Serialize)]
@@ -25,14 +27,14 @@ pub struct HealthResponse {
 async fn health(State(rooms): State<Arc<RoomManager>>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
-        rooms: rooms.room_count(),
+        rooms: rooms.room_count().await,
     })
 }
 
 async fn list_rooms(
     State(rooms): State<Arc<RoomManager>>,
 ) -> Json<Vec<rooms::PublicRoomSummary>> {
-    Json(rooms.list_public_rooms())
+    Json(rooms.list_public_rooms().await)
 }
 
 /// Build the axum router with CORS. Lives in the lib (not the binary) so

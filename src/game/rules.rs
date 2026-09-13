@@ -415,7 +415,13 @@ pub fn maybe_end_game_by_bomb(state: &mut GameState) -> bool {
 }
 
 pub fn skip_finished(state: &mut GameState) {
-    while state.players[state.current_player].finished {
+    // Bounded scan: if >=1 player is unfinished we find it in <=3 increments,
+    // and if ALL 4 are finished (bomb endgame) we must NOT loop forever —
+    // an unbounded `while` here spun a tokio worker at 100% CPU permanently.
+    for _ in 0..4 {
+        if !state.players[state.current_player].finished {
+            return;
+        }
         state.current_player = (state.current_player + 1) % 4;
     }
 }
@@ -530,15 +536,6 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
     state.players[state.current_player].is_bot && state.phase == GamePhase::Playing
 }
 
-/// Process all consecutive bot turns synchronously (no delay). Used for tests.
-pub fn process_bot_turns(state: &mut GameState) {
-    let mut iteration = 0;
-    while process_one_bot_turn(state) {
-        iteration += 1;
-        if iteration > 100 { break; }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +545,70 @@ mod tests {
 
     fn card(rank: Rank, suit: Suit) -> Card {
         Card::new(rank, suit)
+    }
+
+    #[test]
+    fn test_skip_finished_all_finished_does_not_loop() {
+        // Regression: bomb endgame marks ALL 4 players finished. The old
+        // unbounded `while` spun forever here (100% CPU on a tokio worker,
+        // freezing the whole pod). Must return immediately with a valid cp.
+        for start_cp in 0..4 {
+            let mut state = GameState {
+                phase: GamePhase::GameOver,
+                players: vec![
+                    Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                    Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                    Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                    Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                ],
+                ready: vec![true; 4],
+                current_player: start_cp,
+                trick: TrickState::new(),
+                finished_order: vec![0, 1, 2, 3],
+                scores: vec![10, -15, 0, 0],
+                round: 1,
+                total_scores: vec![0, 0, 0, 0],
+                three_discard: None,
+                log: Vec::new(),
+                play_limit_secs: 10,
+                winning_point: 50,
+                game_winner: None,
+                turn_seq: 0,
+            };
+            let start = std::time::Instant::now();
+            skip_finished(&mut state);
+            assert!(start.elapsed() < std::time::Duration::from_millis(100), "skip_finished hung");
+            assert!(state.current_player < 4);
+        }
+    }
+
+    #[test]
+    fn test_skip_finished_normal_skip() {
+        // Unchanged behavior: skips finished seats to the next active one.
+        let mut state = GameState {
+            phase: GamePhase::Playing,
+            players: vec![
+                Player { id: 0, name: "P0".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                Player { id: 1, name: "P1".to_string(), hand: Vec::new(), finished: true, is_bot: false, connected: true, is_creator: false },
+                Player { id: 2, name: "P2".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+                Player { id: 3, name: "P3".to_string(), hand: Vec::new(), finished: false, is_bot: false, connected: true, is_creator: false },
+            ],
+            ready: vec![true; 4],
+            current_player: 0,
+            trick: TrickState::new(),
+            finished_order: vec![0, 1],
+            scores: vec![10, 5, 0, 0],
+            round: 1,
+            total_scores: vec![0, 0, 0, 0],
+            three_discard: None,
+            log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 0,
+        };
+        skip_finished(&mut state);
+        assert_eq!(state.current_player, 2);
     }
 
     #[test]
