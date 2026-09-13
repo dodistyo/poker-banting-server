@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use poker_banting_server::game::card::{Card, Rank, Suit};
 use poker_banting_server::game::combo::{self, ComboType};
 use poker_banting_server::game::rules::*;
@@ -5,6 +7,7 @@ use poker_banting_server::game::state::*;
 use poker_banting_server::game::bot::bot_play;
 use poker_banting_server::protocol::{ClientMsg, ServerMsg};
 use poker_banting_server::rooms::RoomManager;
+use poker_banting_server::store::InMemoryStore;
 
 fn card(rank: Rank, suit: Suit) -> Card {
     Card::new(rank, suit)
@@ -223,58 +226,86 @@ fn test_server_msg_created_serialization() {
 
 // ─── Room management tests ───
 
-#[test]
-fn test_room_create_and_join() {
-    let rm = RoomManager::new(6, 2500, 30, 15);
+#[tokio::test]
+async fn test_room_create_and_join() {
+    let rm = RoomManager::new(
+        Arc::new(InMemoryStore::new()),
+        "test".to_string(),
+        6,
+        2500,
+        30,
+        15,
+    );
 
-    let (code, pid, _msg, _) = rm.create_room("Alice".to_string(), true);
+    let (code, pid, _msg) = rm.create_room("Alice".to_string(), true).await;
     assert_eq!(pid, 0);
     assert_eq!(code.len(), 6);
 
-    let result = rm.join_room(&code, "Bob".to_string());
+    let result = rm.join_room(&code, "Bob".to_string()).await;
     assert!(result.is_ok());
-    let (ServerMsg::Joined { player_id: bob_pid, .. }, _) = result.unwrap() else {
+    let ServerMsg::Joined { player_id: bob_pid, .. } = result.unwrap() else {
         panic!("Expected Joined message");
     };
     assert_eq!(bob_pid, 1);
 }
 
-#[test]
-fn test_room_max_players() {
-    let rm = RoomManager::new(6, 2500, 30, 15);
+#[tokio::test]
+async fn test_room_max_players() {
+    let rm = RoomManager::new(
+        Arc::new(InMemoryStore::new()),
+        "test".to_string(),
+        6,
+        2500,
+        30,
+        15,
+    );
 
-    let (code, _, _, _) = rm.create_room("Alice".to_string(), true); // 1 human + 3 bots
-    rm.join_room(&code, "Bob".to_string()).unwrap(); // Replaces bot
-    rm.join_room(&code, "Charlie".to_string()).unwrap(); // Replaces bot
-    rm.join_room(&code, "Dave".to_string()).unwrap(); // Replaces last bot
+    let (code, _, _) = rm.create_room("Alice".to_string(), true).await; // 1 human + 3 bots
+    rm.join_room(&code, "Bob".to_string()).await.unwrap(); // Replaces bot
+    rm.join_room(&code, "Charlie".to_string()).await.unwrap(); // Replaces bot
+    rm.join_room(&code, "Dave".to_string()).await.unwrap(); // Replaces last bot
 
-    let result = rm.join_room(&code, "Eve".to_string());
+    let result = rm.join_room(&code, "Eve".to_string()).await;
     assert!(result.is_err());
 }
 
-#[test]
-fn test_room_leave_marks_disconnected() {
-    let rm = RoomManager::new(6, 2500, 30, 15);
+#[tokio::test]
+async fn test_room_leave_marks_disconnected() {
+    let rm = RoomManager::new(
+        Arc::new(InMemoryStore::new()),
+        "test".to_string(),
+        6,
+        2500,
+        30,
+        15,
+    );
 
-    let (code, _, _, _) = rm.create_room("Alice".to_string(), true);
-    rm.join_room(&code, "Bob".to_string()).unwrap();
+    let (code, _, _) = rm.create_room("Alice".to_string(), true).await;
+    rm.join_room(&code, "Bob".to_string()).await.unwrap();
 
-    let room = rm.get_room(&code).unwrap();
+    let room = rm.get_room(&code).await.unwrap();
     assert_eq!(room.players.len(), 2);
 
     // Non-creator leave in lobby: room stays, player marked disconnected
-    rm.leave_room(&code, 1);
-    let room = rm.get_room(&code).unwrap();
+    rm.leave_room(&code, 1).await;
+    let room = rm.get_room(&code).await.unwrap();
     assert_eq!(room.players.len(), 2);
     assert!(!room.players[1].connected);
     assert_eq!(room.disconnected_players.len(), 1);
 }
 
-#[test]
-fn test_room_invalid_code() {
-    let rm = RoomManager::new(6, 2500, 30, 15);
+#[tokio::test]
+async fn test_room_invalid_code() {
+    let rm = RoomManager::new(
+        Arc::new(InMemoryStore::new()),
+        "test".to_string(),
+        6,
+        2500,
+        30,
+        15,
+    );
 
-    let result = rm.join_room("INVALID", "Alice".to_string());
+    let result = rm.join_room("INVALID", "Alice".to_string()).await;
     assert!(result.is_err());
 }
 

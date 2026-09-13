@@ -1,0 +1,10 @@
+# Simulation Dockerfile — reuse the HOST glibc release binary (the real
+# Dockerfile cross-compiles to musl, but this sandbox can't fetch the rust
+# toolchain). The host binary is glibc-linked, so base = debian bookworm.
+FROM debian:bookworm-slim
+# glibc binary needs no dynamic loader issues on a glibc host.
+COPY target/release/poker-banting-server /poker-banting-server
+EXPOSE 8080
+# non-root, mirror the real image (USER 65532)
+USER 65532:65532
+ENTRYPOINT ["/poker-banting-server"]

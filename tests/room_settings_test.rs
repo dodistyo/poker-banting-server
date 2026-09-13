@@ -6,6 +6,20 @@ use poker_banting_server::game::rules::*;
 use poker_banting_server::game::state::*;
 use poker_banting_server::protocol::{ClientMsg, ServerMsg};
 use poker_banting_server::rooms::RoomManager;
+use poker_banting_server::store::InMemoryStore;
+
+/// Single in-memory manager; tiny bot delay so any armed driver action
+/// resolves on the first `drive_room` tick.
+fn test_manager() -> Arc<RoomManager> {
+    Arc::new(RoomManager::new(
+        Arc::new(InMemoryStore::new()),
+        "test".to_string(),
+        6,
+        0,
+        30,
+        15,
+    ))
+}
 
 fn card(rank: Rank, suit: Suit) -> Card {
     Card::new(rank, suit)
@@ -87,67 +101,61 @@ fn test_game_state_serializes_new_fields_camel_case() {
 
 // ─── s2: room settings (host-only) ───
 
-#[test]
-fn test_set_room_settings_host_only() {
-    let manager = RoomManager::new(6, 2500, 30, 15);
-    let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
-    manager.join_room(&code, "Bob".to_string()).unwrap();
+#[tokio::test]
+async fn test_set_room_settings_host_only() {
+    let manager = test_manager();
+    let (code, _, _) = manager.create_room("Alice".to_string(), true).await;
+    manager.join_room(&code, "Bob".to_string()).await.unwrap();
 
     // Non-creator is rejected.
-    assert!(manager.set_room_settings(&code, 1, Some(5), None).is_err());
+    assert!(manager.set_room_settings(&code, 1, Some(5), None).await.is_err());
 
     // Creator can set both.
-    manager.set_room_settings(&code, 0, Some(5), Some(100)).unwrap();
-    let st = manager.get_state(&code).unwrap();
+    manager.set_room_settings(&code, 0, Some(5), Some(100)).await.unwrap();
+    let st = manager.get_state(&code).await.unwrap();
     assert_eq!(st.play_limit_secs, 5);
     assert_eq!(st.winning_point, 100);
 
     // Partial update keeps the other value.
-    manager.set_room_settings(&code, 0, Some(30), None).unwrap();
-    let st = manager.get_state(&code).unwrap();
+    manager.set_room_settings(&code, 0, Some(30), None).await.unwrap();
+    let st = manager.get_state(&code).await.unwrap();
     assert_eq!(st.play_limit_secs, 30);
     assert_eq!(st.winning_point, 100);
 }
 
-#[test]
-fn test_set_room_settings_clamps_and_requires_value() {
-    let manager = RoomManager::new(6, 2500, 30, 15);
-    let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+#[tokio::test]
+async fn test_set_room_settings_clamps_and_requires_value() {
+    let manager = test_manager();
+    let (code, _, _) = manager.create_room("Alice".to_string(), true).await;
 
     // Out-of-range rejected: 0s, >120s, 0 points, >9999 points.
-    assert!(manager.set_room_settings(&code, 0, Some(0), None).is_err());
-    assert!(manager.set_room_settings(&code, 0, Some(121), None).is_err());
-    assert!(manager.set_room_settings(&code, 0, None, Some(0)).is_err());
-    assert!(manager.set_room_settings(&code, 0, None, Some(10000)).is_err());
+    assert!(manager.set_room_settings(&code, 0, Some(0), None).await.is_err());
+    assert!(manager.set_room_settings(&code, 0, Some(121), None).await.is_err());
+    assert!(manager.set_room_settings(&code, 0, None, Some(0)).await.is_err());
+    assert!(manager.set_room_settings(&code, 0, None, Some(10000)).await.is_err());
     // Nothing at all is also an error (nothing to set).
-    assert!(manager.set_room_settings(&code, 0, None, None).is_err());
+    assert!(manager.set_room_settings(&code, 0, None, None).await.is_err());
 
     // Boundaries accepted.
-    manager.set_room_settings(&code, 0, Some(1), Some(9999)).unwrap();
-    let st = manager.get_state(&code).unwrap();
+    manager.set_room_settings(&code, 0, Some(1), Some(9999)).await.unwrap();
+    let st = manager.get_state(&code).await.unwrap();
     assert_eq!(st.play_limit_secs, 1);
     assert_eq!(st.winning_point, 9999);
 }
 
-#[test]
-fn test_set_room_settings_only_before_first_round() {
-    let manager = RoomManager::new(6, 2500, 30, 15);
-    let (code, pid, _, _) = manager.create_room("Alice".to_string(), true);
+#[tokio::test]
+async fn test_set_room_settings_only_before_first_round() {
+    let manager = test_manager();
+    let (code, pid, _) = manager.create_room("Alice".to_string(), true).await;
 
     // Works in a fresh Lobby (before the first round has started).
-    manager.set_room_settings(&code, pid, Some(7), None).unwrap();
+    manager.set_room_settings(&code, pid, Some(7), None).await.unwrap();
 
-    // Start the first round, then simulate it ending (waiting room between
-    // rounds). Settings must now be locked for good — the host only tunes
-    // them at the very beginning of the room.
-    manager.start_game(&code, pid).unwrap();
-    {
-        let map = manager.rooms_ref();
-        let mut entry = map.get_mut(&code).unwrap();
-        entry.state.phase = GamePhase::GameOver;
-    }
+    // Start the first round. Settings must now be locked for good — the
+    // host only tunes them at the very beginning of the room.
+    manager.start_game(&code, pid).await.unwrap();
 
-    let err = manager.set_room_settings(&code, pid, Some(7), None).unwrap_err();
+    let err = manager.set_room_settings(&code, pid, Some(7), None).await.unwrap_err();
     assert!(
         err.contains("locked"),
         "settings must be locked after the first round, got: {err}"
@@ -197,32 +205,39 @@ fn test_idle_auto_move_beats_with_lowest_valid_single() {
 
 #[tokio::test]
 async fn test_watchdog_auto_moves_stalled_human() {
-    let manager = Arc::new(RoomManager::new(6, 200, 30, 15));
-    let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+    // Real 1s play limit + small bot delay: the driver is the ONLY thing
+    // that advances the game now, so the test ticks `drive_room` on a loop
+    // until the watchdog's real deadline fires.
+    let manager = Arc::new(RoomManager::new(
+        Arc::new(InMemoryStore::new()),
+        "test".to_string(),
+        6,
+        200,
+        30,
+        15,
+    ));
+    let (code, _, _) = manager.create_room("Alice".to_string(), true).await;
 
-    // Tiny turn limit so the test is quick.
-    manager.set_room_settings(&code, 0, Some(1), None).unwrap();
+    // Tiny turn limit so the watchdog fires fast.
+    manager.set_room_settings(&code, 0, Some(1), None).await.unwrap();
 
-    let should_spawn = manager.start_game(&code, 0).unwrap().1;
-    assert!(should_spawn);
-    // Drive the three-discard phase synchronously (in production this is a
-    // spawned task). Lands on the first trick.
-    manager.process_three_discard_delayed(&code).await;
+    manager.start_game(&code, 0).await.unwrap();
 
-    let start_hand = manager.get_state(&code).unwrap().players[0].hand.len();
-    // The auto three-discard already ran above, so the human starts the
+    let start_hand = manager.get_state(&code).await.unwrap().players[0].hand.len();
+    // The auto three-discard already ran, so the human starts the
     // round with 13 minus however many 3s they were dealt (0..=4). The
     // watchdog logic below is relative to this baseline, so only sanity-
     // bound it — a hard ==13 here made the test shuffle-dependent.
     assert!((9..=13).contains(&start_hand), "unexpected hand size {start_hand}");
 
-    // No human input. Poll until the watchdog auto-moves the human or 8s
-    // pass (fail).
+    // No human input. Tick the driver until the watchdog auto-moves the
+    // human or 8s pass (fail).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     let mut moved = false;
     while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let st = manager.get_state(&code).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = manager.drive_room(&code).await;
+        let st = manager.get_state(&code).await.unwrap();
         if st.players[0].hand.len() < start_hand
             || st.log.iter().any(|l| l.contains("time limit"))
         {
@@ -232,7 +247,7 @@ async fn test_watchdog_auto_moves_stalled_human() {
     }
     assert!(moved, "watchdog should auto-move the stalled human");
 
-    let st = manager.get_state(&code).unwrap();
+    let st = manager.get_state(&code).await.unwrap();
     assert!(
         st.log.iter().any(|l| l.contains("time limit")),
         "auto-move must be logged, log = {:?}",
@@ -310,17 +325,23 @@ fn test_bomb_endgame_sets_match_winner() {
     assert_eq!(s.game_winner, Some(1));
 }
 
-#[test]
-fn test_start_game_blocked_after_match_winner() {
-    let manager = RoomManager::new(6, 2500, 30, 15);
-    let (code, _, _, _) = manager.create_room("Alice".to_string(), true);
+#[tokio::test]
+async fn test_start_game_blocked_after_match_winner() {
+    let manager = test_manager();
+    let (code, _, _) = manager.create_room("Alice".to_string(), true).await;
 
-    let mut st = manager.get_state(&code).unwrap();
-    st.phase = GamePhase::GameOver;
-    st.game_winner = Some(1);
-    manager.update_state(&code, st);
+    // `update_state` is gone with the DashMap field — mutate under the lock
+    // directly, the same way the internal suite does.
+    manager
+        .locked_step(&code, |room| {
+            room.state.phase = GamePhase::GameOver;
+            room.state.game_winner = Some(1);
+            Ok(poker_banting_server::store::MutateOut::default())
+        })
+        .await
+        .unwrap();
 
-    let err = manager.start_game(&code, 0).unwrap_err();
+    let err = manager.start_game(&code, 0).await.unwrap_err();
     assert!(
         err.contains("Match already won"),
         "expected match-won rejection, got: {err}"

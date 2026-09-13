@@ -1,7 +1,29 @@
-use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use super::card::Card;
 use super::combo::ComboType;
+
+/// Wall-clock unix seconds. `Room` must round-trip through Redis as JSON,
+/// and `std::time::Instant` (a per-process monotonic handle) cannot — a
+/// monotonic timestamp captured in pod A is meaningless in pod B. Unix
+/// seconds are the only portable "when" we can persist and compare.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Wall-clock unix **milliseconds** — the precision the stateless driver's
+/// deadlines are tracked at. Same portability rule as [`now_secs`]: a
+/// deadline written by pod A must still be comparable in pod B after the
+/// room round-trips through Redis, so it is a shared wall clock, never a
+/// monotonic `Instant`.
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -115,6 +137,109 @@ fn default_round() -> usize {
     1
 }
 
+/// A one-shot action the stateless driver must execute at
+/// [`DriverState::next_action_at_ms`]. Everything that used to live in a
+/// `tokio::spawn`-ed task with a `sleep` inside now lives HERE, in the room
+/// state, so the action survives a pod crash: whichever pod's driver tick
+/// next reads the room sees the deadline and fires it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PendingAction {
+    /// The room just entered a Playing phase; log the "X leads first trick"
+    /// line (only for round > 1 — round 1 logs "Game starts!"), broadcast,
+    /// and then fall through to the bot-turn driver.
+    EnterPlaying,
+    /// Three-discard phase is armed. Each execution discards the NEXT seat in
+    /// `three_discard.order` (index `three_discard.index`), broadcasts, and
+    /// either re-arms for the next seat or — once the order is exhausted —
+    /// transitions to Playing (the engine has already done the phase flip).
+    StepThreeDiscard,
+    /// One bot turn is due: execute `process_one_bot_turn`, broadcast, and
+    /// re-arm if more bots are queued. After the last bot turn, skip to the
+    /// next active seat and arm the human watchdog if needed.
+    BotTurn,
+}
+
+/// Persistent driver timing for a room. All deadlines are wall-clock unix
+/// milliseconds (`now_millis()`) so they survive a cross-pod round-trip.
+///
+/// Invariants:
+/// - `next_action_at_ms` is only meaningful when `pending` is `Some`.
+/// - `watchdog_deadline_ms` / `watchdog_turn_seq` mirror the armed watchdog;
+///   they exist so the driver (a different pod than the one that armed it)
+///   can re-derive the deadline from state instead of a sleeping task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DriverState {
+    /// Wall-clock unix millis at which the pending action is due.
+    pub next_action_at_ms: u64,
+    /// The one-shot action due at `next_action_at_ms`, if any.
+    pub pending: Option<PendingAction>,
+    /// Unix millis at which the armed play-limit watchdog fires (None = not
+    /// armed). Set whenever the turn is a human's, cleared when it is not.
+    pub watchdog_deadline_ms: Option<u64>,
+    /// The `turn_seq` the armed watchdog was set for (staleness guard).
+    pub watchdog_turn_seq: Option<u32>,
+}
+
+impl DriverState {
+    /// Is there a pending action whose deadline has arrived?
+    pub fn is_due(&self) -> bool {
+        self.pending
+            .as_ref()
+            .map(|_| self.next_action_at_ms <= now_millis())
+            .unwrap_or(false)
+    }
+
+    /// Arm a pending action `delay_ms` from now.
+    pub fn arm(&mut self, action: PendingAction, delay_ms: u64) {
+        self.pending = Some(action);
+        self.next_action_at_ms = now_millis().saturating_add(delay_ms);
+    }
+
+    /// Disarm the pending action (it was executed, or the room left the
+    /// driving phases).
+    pub fn clear_pending(&mut self) {
+        self.pending = None;
+    }
+
+    /// Arm the play-limit watchdog for `turn`'s current `turn_seq`, or
+    /// disarm it when the seat is a bot / finished (bots are exempt).
+    pub fn arm_watchdog(&mut self, state: &GameState) {
+        if state.phase != GamePhase::Playing {
+            self.watchdog_deadline_ms = None;
+            self.watchdog_turn_seq = None;
+            return;
+        }
+        let cp = state.current_player;
+        let Some(p) = state.players.get(cp) else {
+            self.watchdog_deadline_ms = None;
+            self.watchdog_turn_seq = None;
+            return;
+        };
+        if p.is_bot || p.finished {
+            self.watchdog_deadline_ms = None;
+            self.watchdog_turn_seq = None;
+            return;
+        }
+        self.watchdog_deadline_ms =
+            Some(now_millis().saturating_add((state.play_limit_secs as u64).max(1) * 1000));
+        self.watchdog_turn_seq = Some(state.turn_seq);
+    }
+
+    /// Is the armed watchdog due (and still for the current turn)?
+    pub fn watchdog_due(&self, state: &GameState) -> bool {
+        match self.watchdog_deadline_ms {
+            Some(due) => {
+                self.watchdog_turn_seq == Some(state.turn_seq)
+                    && state.phase == GamePhase::Playing
+                    && due <= now_millis()
+            }
+            None => false,
+        }
+    }
+}
+
 impl GameState {
     /// Grow `total_scores` to cover every seat. Per-round `scores` and the
     /// cumulative `total_scores` are separate: `scores` is this round's
@@ -127,23 +252,30 @@ impl GameState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Room {
     pub code: String,
     pub state: GameState,
     pub players: Vec<RoomPlayer>,
     pub started: bool,
-    pub delay_task_spawned: bool,
     pub is_public: bool,
     pub ready: Vec<bool>,
-    #[serde(skip, default)]
-    pub disconnected_players: Vec<(usize, String, Instant)>, // (seat_id, token, disconnect_time)
-    #[serde(skip, default)]
-    pub last_human_disconnect_at: Option<Instant>,
+    // (seat_id, token, disconnect unix-seconds). The token is persisted so a
+    // Rejoin can land on a DIFFERENT pod than the one that saw the drop.
+    #[serde(default)]
+    pub disconnected_players: Vec<(usize, String, u64)>,
+    #[serde(default)]
+    pub last_human_disconnect_at: Option<u64>,
+    /// Persistent driver timing (deadlines + pending action). `default` so a
+    /// room serialized BEFORE this field existed still deserializes after a
+    /// deploy — it just comes back with no armed action (the driver re-arms
+    /// on the next human move / start).
+    #[serde(default)]
+    pub driver: DriverState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomPlayer {
     pub id: usize,
@@ -152,7 +284,7 @@ pub struct RoomPlayer {
     pub connected: bool,
     pub disconnect_time: Option<u64>,
     pub is_creator: bool,
-    #[serde(skip, default)]
+    #[serde(default)]
     pub token: Option<String>,
 }
 
@@ -199,11 +331,11 @@ impl Room {
             state,
             players,
             started: false,
-            delay_task_spawned: false,
             is_public: true,
             ready: vec![true],
             disconnected_players: Vec::new(),
             last_human_disconnect_at: None,
+            driver: DriverState::default(),
         }
     }
 
@@ -347,7 +479,7 @@ impl Room {
 
     pub fn add_disconnected_player(&mut self, seat_id: usize, token: String) {
         if !self.disconnected_players.iter().any(|(id, _, _)| *id == seat_id) {
-            self.disconnected_players.push((seat_id, token, Instant::now()));
+            self.disconnected_players.push((seat_id, token, now_secs()));
         }
     }
 
@@ -374,8 +506,8 @@ impl Room {
     }
 
     pub fn cleanup_expired_disconnected(&mut self, timeout_secs: u64) {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(timeout_secs);
-        self.disconnected_players.retain(|(_, _, t)| *t > cutoff);
+        let now = now_secs();
+        self.disconnected_players.retain(|(_, _, t)| t > &now.saturating_sub(timeout_secs));
     }
 
     pub fn has_connected_human(&self) -> bool {
@@ -384,7 +516,7 @@ impl Room {
 
     pub fn record_human_disconnect(&mut self) {
         if !self.has_connected_human() {
-            self.last_human_disconnect_at = Some(Instant::now());
+            self.last_human_disconnect_at = Some(now_secs());
         } else {
             self.last_human_disconnect_at = None;
         }
@@ -399,7 +531,7 @@ impl Room {
             return false;
         }
         match self.last_human_disconnect_at {
-            Some(t) => Instant::now().duration_since(t).as_secs() >= timeout_secs,
+            Some(t) => now_secs().saturating_sub(t) >= timeout_secs,
             None => false,
         }
     }
@@ -519,6 +651,7 @@ impl Room {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_trick_state_new() {
@@ -733,32 +866,45 @@ mod tests {
         assert!(room.state.ready.iter().all(|&r| r));
     }
 
-    #[test]
-    fn test_start_game_rejected_mid_round() {
+    #[tokio::test]
+    async fn test_start_game_rejected_mid_round() {
         use crate::rooms::RoomManager;
-        let mgr = RoomManager::new(6, 100, 60, 30);
-        let (code, pid, _msg, _s) = mgr.create_room("Host".to_string(), true);
+        use crate::store::InMemoryStore;
+        let mgr = RoomManager::new(
+            Arc::new(InMemoryStore::new()),
+            "test".to_string(),
+            6,
+            100,
+            60,
+            30,
+        );
+        let (code, pid, _msg) = mgr.create_room("Host".to_string(), true).await;
         // Start the round 1 (phase ThreeDiscard).
-        let (msg, _spawn) = mgr.start_game(&code, pid).unwrap();
+        let msg = mgr.start_game(&code, pid).await.unwrap();
         assert!(matches!(msg, crate::protocol::ServerMsg::State { .. }));
         // A stray StartGame mid-round must be rejected, not re-deal.
-        let result = mgr.start_game(&code, pid);
+        let result = mgr.start_game(&code, pid).await;
         assert!(result.is_err(), "mid-round StartGame must be rejected");
     }
 
-    #[test]
-    fn test_start_game_from_gameover_continues() {
+    #[tokio::test]
+    async fn test_start_game_from_gameover_continues() {
         use crate::rooms::RoomManager;
-        let mgr = RoomManager::new(6, 100, 60, 30);
-        let (code, pid, _msg, _s) = mgr.create_room("Host".to_string(), true);
-        let (_, _spawn) = mgr.start_game(&code, pid).unwrap();
+        use crate::store::{InMemoryStore, MutateOut};
+        let mgr = RoomManager::new(
+            Arc::new(InMemoryStore::new()),
+            "test".to_string(),
+            6,
+            100,
+            60,
+            30,
+        );
+        let (code, pid, _msg) = mgr.create_room("Host".to_string(), true).await;
+        let _ = mgr.start_game(&code, pid).await.unwrap();
 
         // Finish round 1 so the room sits in GameOver. The realizer does the
         // total-score accumulation AND the round bump (round 1 -> 2).
-        {
-            let map = mgr.rooms_ref();
-            let mut entry = map.get_mut(&code).unwrap();
-            let room: &mut Room = &mut *entry;
+        mgr.locked_step(&code, |room| {
             room.state.scores = vec![10, 5, 0, -15];
             room.state.finished_order = vec![0, 1, 2];
             for i in 0..3 {
@@ -766,11 +912,13 @@ mod tests {
             }
             assert!(crate::game::rules::finalize_game(&mut room.state));
             assert_eq!(room.state.round, 2);
-        }
+            Ok(MutateOut::default())
+        })
+        .await
+        .unwrap();
 
         // Creator starts again: round 2, no 3-discard, cumulative scores kept.
-        let (msg, spawn) = mgr.start_game(&code, pid).unwrap();
-        assert!(spawn, "continuation must drive bot turns");
+        let msg = mgr.start_game(&code, pid).await.unwrap();
         match msg {
             crate::protocol::ServerMsg::State { state } => {
                 assert_eq!(state.round, 2);
@@ -836,5 +984,161 @@ mod tests {
         assert!(room.started);
         assert_eq!(room.players.len(), 4);
         assert_eq!(room.state.phase, GamePhase::ThreeDiscard);
+    }
+
+    /// The whole point of the Redis migration: a `Room` must survive a JSON
+    /// round-trip losslessly, INCLUDING the fields that used to be
+    /// `#[serde(skip)]` — the per-seat `token` (cross-pod rejoin) and the
+    /// `disconnected_players` / `last_human_disconnect_at` wall-clock markers.
+    /// If any of these silently dropped on (de)serialize, a Rejoin on a
+    /// different pod would 404 the seat.
+    #[test]
+    fn test_room_round_trips_through_json_for_redis() {
+        let mut room = Room::new("XKCD42".to_string(), "Host".to_string(), "host-tok".to_string());
+        room.add_player("Alice".to_string(), "alice-tok".to_string()).unwrap();
+        room.add_player("Bob".to_string(), "bob-tok".to_string()).unwrap();
+        room.start_game(); // fills 2 bots, phase -> ThreeDiscard
+
+        // Seed the disconnect-tracking fields directly (not via the socket
+        // state machine — its has_connected_human() guard would keep the
+        // "last disconnect" marker None while Host is still connected).
+        room.add_disconnected_player(1, "alice-tok".to_string());
+        room.last_human_disconnect_at = Some(now_secs());
+
+        let json = serde_json::to_string(&room).expect("serialize");
+        let back: Room = serde_json::from_str(&json).expect("deserialize");
+
+        // Identity + game phase survive.
+        assert_eq!(back.code, room.code);
+        assert_eq!(back.state.phase, room.state.phase);
+        assert_eq!(back.players.len(), room.players.len());
+
+        // The previously-skipped token round-trips (cross-pod rejoin depends on it).
+        assert_eq!(back.players[0].token.as_deref(), Some("host-tok"));
+        assert_eq!(back.players[1].token.as_deref(), Some("alice-tok"));
+        assert_eq!(back.players[2].token.as_deref(), Some("bob-tok"));
+        // The one bot (players is 3 humans->filled to 4) still has no token.
+        assert!(back.players[3].token.is_none());
+        assert!(back.players[3].is_bot);
+
+        // Disconnected tracking survives with a sane wall-clock timestamp.
+        assert_eq!(back.disconnected_players.len(), 1);
+        assert_eq!(back.disconnected_players[0].0, 1);
+        assert_eq!(back.disconnected_players[0].1, "alice-tok");
+        let now = now_secs();
+        assert!(back.disconnected_players[0].2 > now - 5);
+        assert!(back.last_human_disconnect_at.is_some());
+
+        // Driver timing survives: arm a pending action + watchdog, then
+        // verify the exact deadlines make the round-trip (a pod crash +
+        // re-read must fire the SAME action at the SAME deadline).
+        room.driver
+            .arm(PendingAction::StepThreeDiscard, 600);
+        let due_ms = room.driver.next_action_at_ms;
+        room.driver.arm_watchdog(&room.state);
+        let wd = room.driver.watchdog_deadline_ms;
+        let wd_seq = room.driver.watchdog_turn_seq;
+        let json = serde_json::to_string(&room).expect("serialize");
+        let back: Room = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.driver.pending, Some(PendingAction::StepThreeDiscard));
+        assert_eq!(back.driver.next_action_at_ms, due_ms);
+        assert_eq!(back.driver.watchdog_deadline_ms, wd);
+        assert_eq!(back.driver.watchdog_turn_seq, wd_seq);
+
+        // A second round-trip is stable (idempotent — no field drift).
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    /// A room serialized BEFORE `driver` existed (no `driver` key in the
+    /// JSON) must still deserialize after the deploy: `#[serde(default)]`
+    /// yields a disarmed DriverState rather than an error. This is the
+    /// zero-downtime upgrade path.
+    #[test]
+    fn test_room_json_without_driver_field_still_deserializes() {
+        let room = Room::new("OLDROOM".to_string(), "Host".to_string(), "tok".to_string());
+        let mut json = serde_json::to_string(&room).expect("serialize");
+        // Simulate a pre-driver payload by stripping the field.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut obj = v.as_object().unwrap().clone();
+        assert!(obj.remove("driver").is_some());
+        json = serde_json::to_string(&obj).unwrap();
+
+        let back: Room = serde_json::from_str(&json).expect("old payload must deserialize");
+        assert!(back.driver.pending.is_none());
+        assert!(back.driver.watchdog_deadline_ms.is_none());
+        assert!(back.driver.watchdog_turn_seq.is_none());
+        assert_eq!(back.players.len(), 1);
+    }
+
+    #[test]
+    fn test_driver_state_arm_and_due() {
+        let mut state = GameState {
+            phase: GamePhase::Playing,
+            players: vec![
+                Player {
+                    id: 0,
+                    name: "A".into(),
+                    hand: Vec::new(),
+                    finished: false,
+                    is_bot: false,
+                    connected: true,
+                    is_creator: true,
+                },
+                Player {
+                    id: 1,
+                    name: "Bot".into(),
+                    hand: Vec::new(),
+                    finished: false,
+                    is_bot: true,
+                    connected: true,
+                    is_creator: false,
+                },
+            ],
+            ready: vec![true, true],
+            current_player: 0,
+            trick: TrickState::new(),
+            finished_order: Vec::new(),
+            scores: vec![0, 0],
+            round: 1,
+            total_scores: vec![0, 0],
+            three_discard: None,
+            log: Vec::new(),
+            play_limit_secs: 10,
+            winning_point: 50,
+            game_winner: None,
+            turn_seq: 7,
+        };
+
+        let mut d = DriverState::default();
+        assert!(!d.is_due());
+        assert!(!d.watchdog_due(&state));
+
+        // Bot seat: watchdog must NOT arm (bots are exempt).
+        state.current_player = 1;
+        d.arm_watchdog(&state);
+        assert!(d.watchdog_deadline_ms.is_none());
+        assert!(d.watchdog_turn_seq.is_none());
+
+        // Human seat: arms with deadline ≈ now + 10s, keyed to turn_seq.
+        state.current_player = 0;
+        d.arm_watchdog(&state);
+        let now = now_millis();
+        let wd = d.watchdog_deadline_ms.expect("watchdog armed");
+        assert!(wd >= now + 9_900 && wd <= now + 11_000);
+        assert_eq!(d.watchdog_turn_seq, Some(7));
+        assert!(!d.watchdog_due(&state)); // not yet due
+
+        // A stale watchdog (turn moved on) must never fire.
+        state.turn_seq = 8;
+        assert!(!d.watchdog_due(&state));
+
+        // Pending action: far-future is not due; past is due.
+        d.arm(PendingAction::BotTurn, 60_000);
+        assert!(!d.is_due());
+        d.next_action_at_ms = now_millis().saturating_sub(1);
+        assert!(d.is_due());
+        d.clear_pending();
+        assert!(!d.is_due());
     }
 }

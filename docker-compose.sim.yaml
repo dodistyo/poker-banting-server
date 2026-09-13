@@ -1,0 +1,89 @@
+# Simulation compose: 2 backend pods + Redis + nginx LB, with Cloud Run
+# instance resource limits (1 vCPU / 2 GiB) applied per backend container
+# so the 1000-CCU load test runs under the SAME CPU/RAM envelope as prod.
+#
+# The real Dockerfile cross-compiles to musl (sandbox can't fetch rust);
+# Dockerfile.sim wraps the host glibc release binary instead — same code.
+#
+# Ports (same contract as docker-compose.yml):
+#   8085 = nginx LB, 8081 = pod-1, 8082 = pod-2, 6390 = redis direct
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    ports:
+      - "6390:6379"
+
+  backend-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.sim
+    image: pb-sim-backend:latest
+    environment:
+      PORT: "8080"
+      STORAGE: "redis"
+      REDIS_URL: "redis://redis:6379/0"
+      POD_NAME: "pod-1"
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2G
+
+  backend-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.sim
+    image: pb-sim-backend:latest
+    environment:
+      PORT: "8080"
+      STORAGE: "redis"
+      REDIS_URL: "redis://redis:6379/0"
+      POD_NAME: "pod-2"
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2G
+
+  lb:
+    image: nginx:1.27-alpine
+    # sim nginx.conf: worker_connections 4096 (stock conf = 1024, not enough
+    # for 1000 proxied WS = ~2000 sockets + margin)
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./deploy/nginx.sim.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend-1
+      - backend-2
+    ports:
+      - "8085:80"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M

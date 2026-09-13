@@ -1,0 +1,87 @@
+{
+  "vus": 2,
+  "duration": "15s",
+  "target": "ws://127.0.0.1:80/ws",
+  "ws_connect_ms": {
+    "contains": "time",
+    "values": {
+      "avg": 0,
+      "min": 0,
+      "med": 0,
+      "max": 0,
+      "p(90)": 0,
+      "p(95)": 0
+    },
+    "thresholds": {
+      "p(95)<500": {
+        "ok": true
+      }
+    },
+    "type": "trend"
+  },
+  "room_create_ms": {
+    "type": "trend",
+    "contains": "time",
+    "values": {
+      "p(90)": 0,
+      "p(95)": 0,
+      "avg": 0,
+      "min": 0,
+      "med": 0,
+      "max": 0
+    },
+    "thresholds": {
+      "p(95)<300": {
+        "ok": true
+      }
+    }
+  },
+  "game_start_ms": {
+    "type": "trend",
+    "contains": "time",
+    "values": {
+      "avg": 0,
+      "min": 0,
+      "med": 0,
+      "max": 0,
+      "p(90)": 0,
+      "p(95)": 0
+    },
+    "thresholds": {
+      "p(95)<1500": {
+        "ok": true
+      }
+    }
+  },
+  "bot_turn_ms": {
+    "contains": "time",
+    "values": {
+      "max": 0,
+      "p(90)": 0,
+      "p(95)": 0,
+      "avg": 0,
+      "min": 0,
+      "med": 0
+    },
+    "thresholds": {
+      "p(95)<5000": {
+        "ok": true
+      }
+    },
+    "type": "trend"
+  },
+  "ws_connect_errors": {
+    "thresholds": {
+      "rate<0.05": {
+        "ok": true
+      }
+    },
+    "type": "rate",
+    "contains": "default",
+    "values": {
+      "rate": 0,
+      "passes": 0,
+      "fails": 6
+    }
+  }
+}

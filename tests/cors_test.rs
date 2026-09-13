@@ -9,11 +9,19 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use poker_banting_server::build_app;
 use poker_banting_server::rooms::RoomManager;
+use poker_banting_server::store::InMemoryStore;
 use std::sync::Arc;
 use tower::util::ServiceExt;
 
 fn app() -> axum::Router {
-    build_app(Arc::new(RoomManager::new(6, 1000, 0, 10)))
+    build_app(Arc::new(RoomManager::new(
+        Arc::new(InMemoryStore::new()),
+        "test".to_string(),
+        6,
+        1000,
+        0,
+        10,
+    )))
 }
 
 fn get_with_origin(origin: &str) -> Request<Body> {

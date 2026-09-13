@@ -9,6 +9,13 @@ pub struct Config {
     pub disconnect_timeout_sec: u64,
     pub bot_turn_delay_ms: u64,
     pub room_orphan_timeout_secs: u64,
+    /// "memory" (single-instance dev) or "redis" (multi-pod shared state).
+    pub storage: String,
+    /// Redis connection string, required only when `storage == "redis"`.
+    pub redis_url: Option<String>,
+    /// Redis lock TTL for cross-pod room locks (ms). A crash mid-step
+    /// auto-releases the lock after this long.
+    pub store_lock_ttl_ms: u64,
   }
 
 /// Resolve the bind port with Cloud Run in mind.
@@ -62,6 +69,15 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+            storage: env::var("STORAGE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "memory".to_string()),
+            redis_url: env::var("REDIS_URL").ok().filter(|v| !v.trim().is_empty()),
+            store_lock_ttl_ms: env::var("STORE_LOCK_TTL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15000),
         }
     }
 }
@@ -106,5 +122,8 @@ mod tests {
         assert_eq!(config.disconnect_timeout_sec, 15);
         assert_eq!(config.bot_turn_delay_ms, 2500);
         assert_eq!(config.room_orphan_timeout_secs, 30);
+        assert_eq!(config.storage, "memory");
+        assert!(config.redis_url.is_none());
+        assert_eq!(config.store_lock_ttl_ms, 15000);
     }
 }

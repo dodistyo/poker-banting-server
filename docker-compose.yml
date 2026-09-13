@@ -1,0 +1,83 @@
+# Local multi-pod reproduction of the production Cloud Run topology (Option B).
+#
+#   2 stateless backend instances + Redis (primary + 2 replicas) behind an
+#   nginx round-robin load balancer. ALL room state lives in Redis, so both
+#   backends see the exact same rooms — that is the whole point of this.
+#
+# Host ports:
+#   8085 = nginx LB (what clients talk to)
+#   8081 = backend-1 direct (test one specific pod)
+#   8082 = backend-2 direct (test the other pod)
+#   6390 = redis primary direct (redis-cli debugging)
+#
+# Usage:
+#   docker compose up --build
+#   # play: http://localhost:8085  (or hit 8081/8082 directly to force a pod)
+#
+# The client dev-server (node dev-server.js on :3000) can proxy /api to
+# either 8085 (LB) or a single pod for controlled testing.
+
+services:
+  redis-primary:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6390:6379"
+
+  redis-replica-1:
+    image: redis:7-alpine
+    command: ["redis-server", "--replicaof", "redis-primary:6379"]
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+
+  redis-replica-2:
+    image: redis:7-alpine
+    command: ["redis-server", "--replicaof", "redis-primary:6379"]
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+
+  backend-1:
+    build: .
+    environment:
+      PORT: "8080"
+      STORAGE: "redis"
+      REDIS_URL: "redis://redis-primary:6379/0"
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+
+  backend-2:
+    build: .
+    environment:
+      PORT: "8080"
+      STORAGE: "redis"
+      REDIS_URL: "redis://redis-primary:6379/0"
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend-1
+      - backend-2
+    ports:
+      - "8085:80"
+
+volumes:
+  redis-data:
