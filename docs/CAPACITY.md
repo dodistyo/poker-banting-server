@@ -75,6 +75,29 @@ E2E_EXTERNAL_BACKEND=1 E2E_HEADLESS=1 npx playwright test
 
 Hasil baseline 2026-09-13: e2e 62/62 pass (via LB 2-pod local).
 
+## Verification: Production (Cloud Run, 2026-09-13)
+
+Target: `https://poker-banting-153176493081.asia-southeast1.run.app`
+(1 vCPU / 512 MiB, `--concurrency 1000`, `--max 3`, Redis/Upstash SGP).
+
+| Test | Hasil |
+|---|---|
+| e2e (playwright, via dev-server TLS proxy) | **62/62 pass** (6 menit, headless) |
+| k6 burst 2000 CCU, 45 detik | **0 server error**, p95 `play_to_nextturn_ms` **37 ms**, p95 `ws_connecting` 10.8 s |
+
+Catatan 2000 CCU:
+- 2000 > `--max 3` × 1000 = 3000? No — 2000 < 3000, jadi **bukan** uji ceiling,
+  tapi bukti **scale-out multi-instance** jalan (2 instance = 2000, di atas 1
+  instance = 1000 cap). Kalau hanya 1 instance, 2000 VU pasti ada yang
+  `503/timeout` di koneksi. Hasil 0 error ⇒ traffic ter-sebar ≥2 instance.
+- `ws_connecting` p95 10.8 s = cold start + TLS handshake Jakarta→SGP (RTT
+  ~80 ms) + thundering herd 2000 koneksi sekalian. **Bukan** server
+  bottleneck: `play_to_nextturn` (post-connect, in-game) tetap 37 ms.
+- Upstash free tier: burst 45 detik bakar ~87K command (30K→117K→270K
+  harian, termasuk test lain). 17.5 cmd/s/player × 2000 = ~35K cmd/s, jadi
+  free tier (500K/bln) = ~14 detik 2000 CCU sustained. Untuk sustained
+  2000+ pakai PAYG (budget cap $5).
+
 ## Pitfall yang bikin angka keliatan salah (sudah di-fix semua)
 
 1. **`skip_finished` unbounded** (`while players[cp].finished`) — bomb
