@@ -536,15 +536,6 @@ pub fn process_one_bot_turn(state: &mut GameState) -> bool {
     state.players[state.current_player].is_bot && state.phase == GamePhase::Playing
 }
 
-/// Process all consecutive bot turns synchronously (no delay). Used for tests.
-pub fn process_bot_turns(state: &mut GameState) {
-    let mut iteration = 0;
-    while process_one_bot_turn(state) {
-        iteration += 1;
-        if iteration > 100 { break; }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
