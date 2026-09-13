@@ -99,7 +99,7 @@ jobs:
             --allow-unauthenticated \
             --concurrency 1000 \
             --timeout 3600s \
-            --cpu 0.5 \
+            --cpu 1 \
             --memory 512Mi \
             --max 3
           echo "Service URL: https://$(gcloud run services describe poker-banting \
