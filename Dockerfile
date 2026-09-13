@@ -9,14 +9,15 @@
 #   final binary is copied out), while the FINAL binary is musl → fully
 #   static, no dynamic loader → runs on `FROM scratch`.
 FROM rust:1.88-bookworm AS builder
-# musl-tools provides the musl C compiler (`musl-gcc`) that `ring`/`rustls`
-# (pulled in by the redis `tokio-rustls-comp` TLS feature) needs when
-# cross-compiling to musl — `cc` looks for `x86_64-linux-musl-gcc`, so we
-# alias musl-gcc to that exact name. Without it the build fails with
-# "failed to find tool x86_64-linux-musl-gcc".
+# musl-tools provides the musl C compiler that `ring`/`rustls` (pulled in
+# by the redis `tokio-rustls-comp` TLS feature) need when cross-compiling to
+# musl — `cc` looks for `x86_64-linux-musl-gcc`. On Debian bookworm
+# musl-tools already ships that name as a symlink to musl-gcc; the ln below
+# is a no-op guard for distros where only `musl-gcc` exists (must be
+# tolerant — `ln -sf` on an existing symlink still exits 1).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends musl-tools \
-    && ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-linux-musl-gcc \
+    && (ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-linux-musl-gcc 2>/dev/null || true) \
     && rm -rf /var/lib/apt/lists/* \
     && rustup target add x86_64-unknown-linux-musl
 WORKDIR /app
