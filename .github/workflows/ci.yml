@@ -77,9 +77,14 @@ jobs:
           #                        flag `--max-instances` is SILENTLY IGNORED
           #                        by gcloud (verified 568.0.0) — only the
           #                        short `--max` persists.
-          #   --cpu 0.5 --memory 512Mi : 512Mi is the Cloud Run minimum memory;
-          #                        0.5 vCPU verified enough (1000 active =
-          #                        ~20% CPU on 1 vCPU; RAM ~80% at 2500).
+          #   --cpu 1 --memory 512Mi  : 512Mi is the Cloud Run minimum memory.
+          #                        CPU must be >= 1 (dedicated): Cloud Run
+          #                        REJECTS cpu < 1 with concurrency > 1
+          #                        ("Total cpu < 1 is not supported with
+          #                         concurrency > 1"). We need concurrency
+          #                        1000 for WS, so 0.5/0.08 shared vCPU is
+          #                        off the table. 1 vCPU verified enough
+          #                        (1000 active ~= 20% CPU; RAM ~80% @ 2500).
           # ENV STORAGE/REDIS_URL: NOT set here on purpose — they live in the
           # service config, set manually via:
           #   gcloud run services update poker-banting \
