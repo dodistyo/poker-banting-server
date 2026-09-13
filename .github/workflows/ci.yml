@@ -104,4 +104,4 @@ jobs:
             --max 3
           echo "Service URL: https://$(gcloud run services describe poker-banting \
             --region asia-southeast1 --project clear-region-377216 \
-            --format='value(status.url)')'
+            --format='value(status.url)')"
