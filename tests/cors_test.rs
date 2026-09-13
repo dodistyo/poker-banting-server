@@ -17,6 +17,8 @@ fn app() -> axum::Router {
     build_app(Arc::new(RoomManager::new(
         Arc::new(InMemoryStore::new()),
         "test".to_string(),
+
+        "test".to_string(),
         6,
         1000,
         0,

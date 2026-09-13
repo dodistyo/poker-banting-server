@@ -286,6 +286,15 @@ pub struct RoomPlayer {
     pub is_creator: bool,
     #[serde(default)]
     pub token: Option<String>,
+    /// The pod that last owned this seat's live connection. `None` for seats
+    /// that were never stamped (in-memory dev, or old pre-rewrite state) or
+    /// that have been released (a dead pod's seat after the reaper ran). The
+    /// per-pod liveness tick compares this against the set of live pods: a
+    /// `connected` seat owned by a dead pod is a zombie and gets force-
+    /// disconnected, so a `kill -9` self-heals within one heartbeat TTL
+    /// instead of waiting for the orphan reaper. See `RoomManager::reap_zombie_seats`.
+    #[serde(default)]
+    pub owned_by_pod: Option<String>,
 }
 
 impl Room {
@@ -298,6 +307,7 @@ impl Room {
             disconnect_time: None,
             is_creator: true,
             token: Some(host_token),
+            owned_by_pod: None,
         }];
 
         let state = GameState {
@@ -356,6 +366,7 @@ impl Room {
             disconnect_time: None,
             is_creator: false,
             token: Some(token),
+            owned_by_pod: None,
         });
         self.ready.push(false);
 
@@ -384,6 +395,7 @@ impl Room {
             disconnect_time: None,
             is_creator: false,
             token: None,
+            owned_by_pod: None,
         });
         self.ready.push(true);
 
@@ -873,6 +885,7 @@ mod tests {
         let mgr = RoomManager::new(
             Arc::new(InMemoryStore::new()),
             "test".to_string(),
+            "test-boot".to_string(),
             6,
             100,
             60,
@@ -894,6 +907,7 @@ mod tests {
         let mgr = RoomManager::new(
             Arc::new(InMemoryStore::new()),
             "test".to_string(),
+            "test-boot".to_string(),
             6,
             100,
             60,

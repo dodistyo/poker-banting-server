@@ -57,6 +57,11 @@ pub struct RoomManager {
     /// This pod's id — stamped into cross-pod publishes so receivers can drop
     /// their own echo.
     pod_id: String,
+    /// LIVENESS identity (unique per process boot). Stamped as `owned_by_pod`
+    /// on every seat this pod serves: seats are reclaimed when the *process*
+    /// dies, and a pod-name respawned under the same `POD_NAME` is a DIFFERENT
+    /// boot — its seats are not its inheritance.
+    liveness_id: String,
     code_length: usize,
     bot_turn_delay_ms: u64,
     orphan_timeout_secs: u64,
@@ -67,6 +72,7 @@ impl RoomManager {
     pub fn new(
         store: Arc<dyn RoomStore>,
         pod_id: String,
+        liveness_id: String,
         code_length: usize,
         bot_turn_delay_ms: u64,
         orphan_timeout_secs: u64,
@@ -75,6 +81,7 @@ impl RoomManager {
         RoomManager {
             store,
             sessions: Arc::new(DashMap::new()),
+            liveness_id,
             pod_id,
             code_length,
             bot_turn_delay_ms,
@@ -285,6 +292,9 @@ impl RoomManager {
         let room = loop {
             let token = Self::generate_token();
             let mut r = Room::new(code.clone(), host_name.clone(), token);
+            // Record pod ownership so the seat-liveness reaper knows which pod
+            // holds this seat (hard-dead pods leave their seats `connected`).
+            r.players[0].owned_by_pod = Some(self.liveness_id.clone());
             r.is_public = is_public;
             match self.store.create(&code, &r).await {
                 Ok(()) => break r,
@@ -336,6 +346,9 @@ impl RoomManager {
                     return Err("Room is full".to_string());
                 }
                 let player_id = room.add_player(name, token.clone())?;
+                // Record pod ownership so the seat-liveness reaper knows which
+                // pod holds this seat (a hard-dead pod leaves it `connected`).
+                room.players[player_id].owned_by_pod = Some(self.liveness_id.clone());
                 let state = room.state.clone();
                 let player_name = state
                     .players
@@ -382,6 +395,9 @@ impl RoomManager {
                 {
                     let (seat_id, _, _) = room.disconnected_players.remove(pos);
                     room.restore_seat(seat_id, name, token);
+                    // The reconnecting pod claims the seat as its own — this
+                    // is what clears any stale ownership from a dead pod.
+                    room.players[seat_id].owned_by_pod = Some(self.liveness_id.clone());
                     room.human_reconnected();
 
                     let state = room.state.clone();
@@ -422,120 +438,149 @@ impl RoomManager {
         Ok(out.reply.unwrap())
     }
 
+    /// Disconnect a single human seat, mutating `room` and returning what to
+    /// broadcast (or `None` if the seat id doesn't exist). This is the EXACT
+    /// body of a graceful socket drop — the single source of truth for what
+    /// "a player's connection is gone" means:
+    ///
+    /// - public room, lobby, creator drops → dissolve the room
+    /// - lobby (any) → mark disconnected, transfer the crown if the creator,
+    ///   compact the seat + renumber, record the human disconnect
+    /// - mid-game → the seat becomes a bot so the round continues, but the
+    ///   player's token is kept in `disconnected_players` so a reconnect can
+    ///   reclaim the exact seat
+    ///
+    /// Both the WebSocket close path ([`leave_room`]) and the seat-liveness
+    /// reaper ([`reap_zombie_seats`]) call this, so a seat freed because its
+    /// pod was `kill -9`'d behaves identically to one freed by a clean tab
+    /// close. `lobby_timeout`/`orphan_timeout` come from this manager's config.
+    fn apply_seat_disconnect(
+        room: &mut Room,
+        player_id: usize,
+        lobby_timeout: u64,
+        orphan_timeout: u64,
+    ) -> Option<MutateOut> {
+        let player = room
+            .players
+            .iter()
+            .find(|p| p.id == player_id)
+            .cloned()?;
+        let (player_name, is_bot, token, is_creator) = (
+            player.name.clone(),
+            player.is_bot,
+            player.token.clone(),
+            player.is_creator,
+        );
+
+        // Public room, lobby, creator drops: dissolve.
+        if room.state.phase == GamePhase::Lobby && is_creator && !is_bot && room.is_public {
+            let mut out = MutateOut::default();
+            out.removed = true;
+            out.broadcast.push(ServerMsg::PlayerLeft {
+                player_id,
+                name: player_name,
+            });
+            return Some(out);
+        }
+
+        if !is_bot {
+            if let Some(t) = token {
+                room.add_disconnected_player(player_id, t);
+            }
+
+            if room.state.phase == GamePhase::Lobby {
+                if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
+                    player.connected = false;
+                    player.disconnect_time = Some(crate::game::state::now_secs());
+                    player.owned_by_pod = None;
+                }
+                if is_creator {
+                    room.transfer_crown_from(player_id);
+                }
+                let mut out = MutateOut::default();
+                out.broadcast.push(ServerMsg::PlayerLeft {
+                    player_id,
+                    name: player_name.clone(),
+                });
+                let (removed, renumbered) =
+                    room.cleanup_disconnected_lobby_players(lobby_timeout);
+                for (rid, rname) in &removed {
+                    out.broadcast.push(ServerMsg::PlayerLeft {
+                        player_id: *rid,
+                        name: rname.clone(),
+                    });
+                }
+                room.record_human_disconnect();
+                if room.is_orphaned(orphan_timeout) {
+                    out.removed = true;
+                    return Some(out);
+                }
+                out.renumbered = renumbered;
+                out.broadcast.push(ServerMsg::State {
+                    state: room.state.clone(),
+                });
+                return Some(out);
+            }
+
+            // Mid-game socket drop: become a bot so the round continues.
+            if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
+                player.name = format!("Bot ({})", player_name);
+                player.is_bot = true;
+                player.connected = true;
+                player.disconnect_time = None;
+                player.token = None;
+                player.owned_by_pod = None;
+            }
+            if let Some(player) = room.state.players.iter_mut().find(|p| p.id == player_id) {
+                player.name = format!("Bot ({})", player_name);
+                player.is_bot = true;
+                player.connected = true;
+            }
+            let state = room.state.clone();
+            room.record_human_disconnect();
+            let orphaned = room.is_orphaned(orphan_timeout);
+            let mut out = MutateOut::default();
+            if orphaned {
+                out.removed = true;
+            } else {
+                out.broadcast.push(ServerMsg::PlayerLeft {
+                    player_id,
+                    name: player_name.clone(),
+                });
+                out.broadcast.push(ServerMsg::State { state });
+            }
+            return Some(out);
+        }
+
+        // Bot (or a bot-ified seat) leaving: just mark disconnected.
+        if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
+            player.connected = false;
+            player.disconnect_time = Some(crate::game::state::now_secs());
+        }
+        Some(MutateOut::default())
+    }
+
     pub async fn leave_room(&self, code: &str, player_id: usize) -> Option<ServerMsg> {
         let code = code.to_uppercase();
         let lobby_timeout = self.lobby_disconnect_timeout_secs;
         let orphan_timeout = self.orphan_timeout_secs;
         let out = self
             .locked_step(&code, move |room| {
-                let player = room
+                // Capture the display name BEFORE the mutation (a lobby seat
+                // may be renamed/compacted), so the reply to the disconnecting
+                // client carries the right name — matching the original.
+                let name = room
                     .players
                     .iter()
                     .find(|p| p.id == player_id)
-                    .cloned()
+                    .map(|p| p.name.clone())
                     .ok_or_else(|| "Player not found".to_string())?;
-                let (player_name, is_bot, token, is_creator) = (
-                    player.name.clone(),
-                    player.is_bot,
-                    player.token.clone(),
-                    player.is_creator,
-                );
-
-                // Public room, lobby, creator drops the tab: dissolve.
-                if room.state.phase == GamePhase::Lobby && is_creator && !is_bot && room.is_public {
-                    let mut out = MutateOut::default();
-                    out.removed = true;
-                    out.broadcast.push(ServerMsg::PlayerLeft {
-                        player_id,
-                        name: player_name,
-                    });
-                    return Ok(out);
-                }
-
-                if !is_bot {
-                    if let Some(t) = token {
-                        room.add_disconnected_player(player_id, t);
-                    }
-
-                    if room.state.phase == GamePhase::Lobby {
-                        if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
-                            player.connected = false;
-                            player.disconnect_time = Some(crate::game::state::now_secs());
-                        }
-                        if is_creator {
-                            room.transfer_crown_from(player_id);
-                        }
-                        let mut out = MutateOut::default();
-                        out.broadcast.push(ServerMsg::PlayerLeft {
-                            player_id,
-                            name: player_name.clone(),
-                        });
-                        let (removed, renumbered) =
-                            room.cleanup_disconnected_lobby_players(lobby_timeout);
-                        for (rid, rname) in &removed {
-                            out.broadcast.push(ServerMsg::PlayerLeft {
-                                player_id: *rid,
-                                name: rname.clone(),
-                            });
-                        }
-                        room.record_human_disconnect();
-                        if room.is_orphaned(orphan_timeout) {
-                            out.removed = true;
-                            return Ok(out);
-                        }
-                        out.renumbered = renumbered;
-                        out.broadcast.push(ServerMsg::State {
-                            state: room.state.clone(),
-                        });
-                        out.reply = Some(ServerMsg::PlayerLeft {
-                            player_id,
-                            name: player_name,
-                        });
-                        return Ok(out);
-                    }
-
-                    // Mid-game socket drop: become a bot so the round continues.
-                    if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
-                        player.name = format!("Bot ({})", player_name);
-                        player.is_bot = true;
-                        player.connected = true;
-                        player.disconnect_time = None;
-                        player.token = None;
-                    }
-                    if let Some(player) = room.state.players.iter_mut().find(|p| p.id == player_id) {
-                        player.name = format!("Bot ({})", player_name);
-                        player.is_bot = true;
-                        player.connected = true;
-                    }
-                    let state = room.state.clone();
-                    room.record_human_disconnect();
-                    let orphaned = room.is_orphaned(orphan_timeout);
-                    let mut out = MutateOut::default();
-                    if orphaned {
-                        out.removed = true;
-                    } else {
-                        out.broadcast.push(ServerMsg::PlayerLeft {
-                            player_id,
-                            name: player_name.clone(),
-                        });
-                        out.broadcast.push(ServerMsg::State { state });
-                    }
-                    out.reply = Some(ServerMsg::PlayerLeft {
-                        player_id,
-                        name: player_name,
-                    });
-                    return Ok(out);
-                }
-
-                // Bot (or a bot-ified seat) leaving: just mark disconnected.
-                if let Some(player) = room.players.iter_mut().find(|p| p.id == player_id) {
-                    player.connected = false;
-                    player.disconnect_time = Some(crate::game::state::now_secs());
-                }
-                let mut out = MutateOut::default();
+                let mut out =
+                    Self::apply_seat_disconnect(room, player_id, lobby_timeout, orphan_timeout)
+                        .ok_or_else(|| "Player not found".to_string())?;
                 out.reply = Some(ServerMsg::PlayerLeft {
                     player_id,
-                    name: player_name,
+                    name,
                 });
                 Ok(out)
             })
@@ -755,6 +800,89 @@ impl RoomManager {
             self.store.unlock(&code, lock).await;
         }
         dropped
+    }
+
+    /// Free seats that are still marked `connected` because their owning pod
+    /// died hard (`kill -9` / OOM) and so never ran [`leave_room`]. This is the
+    /// seat-level liveness fix: a seat owned by a pod that has stopped
+    /// heartbeating (its `pod:alive:{id}` key expired) is reclaimed, so a
+    /// reconnecting player is accepted within one reap window (~`pod_alive_ttl`)
+    /// instead of waiting for the slow orphan-room reaper.
+    ///
+    /// A seat is a zombie iff it is a HUMAN seat, `connected`, and its
+    /// `owned_by_pod` (really the BOOT id stamped at connect time) names a
+    /// boot that is no longer in [`RoomStore::live_pods`]. `InMemoryStore` always reports a single live "memory" pod, so in
+    /// single-process mode nothing is ever a zombie and this is a safe no-op.
+    /// Each reclaimed seat goes through the SAME [`apply_seat_disconnect`] the
+    /// graceful drop path uses, so behavior is identical to a clean tab close.
+    /// Returns the number of seats reclaimed.
+    pub async fn reap_zombie_seats(&self) -> usize {
+        use std::sync::{Arc, Mutex};
+        // Liveness is read ONCE per tick, before entering any room lock — the
+        // lock-step closures are sync and cannot await. It is moved into each
+        // closure so the reap re-checks the SAME snapshot right before mutating
+        // (a pod that flaps back online mid-tick simply isn't reaped this tick).
+        let live = self.store.live_pods().await;
+        let codes = self.store.codes().await;
+        let mut reclaimed = 0usize;
+        for code in codes {
+            // Cheap pre-filter (plain read, no lock): skip rooms where no seat
+            // is even potentially a zombie, so we don't contend for the room
+            // lock for nothing.
+            let Some(room) = self.store.get(&code).await else {
+                continue;
+            };
+            let potentially_zombie = room.players.iter().any(|p| {
+                !p.is_bot
+                    && p.connected
+                    && matches!(&p.owned_by_pod, Some(owner) if !live.contains(owner))
+            });
+            if !potentially_zombie {
+                continue;
+            }
+            let code = code.clone();
+            let live_for_step = live.clone(); // move a clone into the closure
+            // `Arc<Mutex>` (not `Rc`) so the counter is `Send`: the closure is
+            // handed to `locked_step`, whose future must be `Send` under tokio.
+            let seats_counter = Arc::new(Mutex::new(0usize));
+            let seats_ref = seats_counter.clone();
+            let lobby_timeout = self.lobby_disconnect_timeout_secs;
+            let orphan_timeout = self.orphan_timeout_secs;
+            let _ = self
+                .locked_step(&code, move |room| {
+                    let zombies: Vec<usize> = room
+                        .players
+                        .iter()
+                        .filter(|p| {
+                            !p.is_bot
+                                && p.connected
+                                && matches!(&p.owned_by_pod, Some(owner) if !live_for_step.contains(owner))
+                        })
+                        .map(|p| p.id)
+                        .collect();
+                    // Accumulate each seat's disconnect MutateOut so with_lock
+                    // saves the full diff, applies the real renumber table, and
+                    // emits the real broadcasts cross-pod — exactly what a
+                    // sequence of graceful drops would have produced.
+                    let mut merged = MutateOut::default();
+                    let mut seats = 0usize;
+                    for id in zombies {
+                        if let Some(o) =
+                            Self::apply_seat_disconnect(room, id, lobby_timeout, orphan_timeout)
+                        {
+                            merged.broadcast.extend(o.broadcast);
+                            merged.renumbered.extend(o.renumbered);
+                            merged.removed = merged.removed || o.removed;
+                            seats += 1;
+                        }
+                    }
+                    *seats_ref.lock().unwrap() = seats;
+                    Ok(merged)
+                })
+                .await;
+            reclaimed += *seats_counter.lock().unwrap();
+        }
+        reclaimed
     }
 
     pub async fn list_public_rooms(&self) -> Vec<PublicRoomSummary> {
@@ -1192,8 +1320,9 @@ impl RoomManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::InMemoryStore;
+    use crate::store::{InMemoryStore, RoomLock, RoomStore};
     use std::sync::Arc;
+    use async_trait::async_trait;
 
     /// Build a single-instance manager over an in-memory store. `bot_delay` is
     /// set small (0) in tests so the driver's chained fires resolve without
@@ -1201,6 +1330,7 @@ mod tests {
     fn mem(code_len: usize, bot: u64, orphan: u64, lobby: u64) -> Arc<RoomManager> {
         Arc::new(RoomManager::new(
             Arc::new(InMemoryStore::new()),
+            "test".to_string(),
             "test".to_string(),
             code_len,
             bot,
@@ -2006,5 +2136,148 @@ mod tests {
         let state_leaver = room.state.players.iter().find(|p| p.id == 1).unwrap();
         assert!(state_leaver.is_bot);
         assert_eq!(state_leaver.name, "Bot (Bob)");
+    }
+
+    /// Test-only store: `InMemoryStore`'s shared room state (the Redis
+    /// analog) with a CONTROLLABLE `live_pods()` — this lets a test simulate
+    /// a pod dying hard: its heartbeat key "expires" the moment we drop it
+    /// from the set.
+    #[derive(Clone)]
+    struct LivenessStore {
+        inner: Arc<InMemoryStore>,
+        live: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    }
+
+    #[async_trait]
+    impl RoomStore for LivenessStore {
+        async fn get(&self, code: &str) -> Option<Room> {
+            self.inner.get(code).await
+        }
+        async fn codes(&self) -> Vec<String> {
+            self.inner.codes().await
+        }
+        async fn create(&self, code: &str, room: &Room) -> Result<(), String> {
+            self.inner.create(code, room).await
+        }
+        async fn save(&self, code: &str, room: &Room) {
+            self.inner.save(code, room).await
+        }
+        async fn delete(&self, code: &str) {
+            self.inner.delete(code).await
+        }
+        async fn try_lock(&self, code: &str) -> Option<RoomLock> {
+            self.inner.try_lock(code).await
+        }
+        async fn unlock(&self, code: &str, lock: RoomLock) {
+            self.inner.unlock(code, lock).await
+        }
+        async fn publish(&self, code: &str, pod: &str, msg: &ServerMsg) {
+            self.inner.publish(code, pod, msg).await
+        }
+        async fn heartbeat(&self) {
+            // No-op: liveness is controlled directly via `live`.
+        }
+        async fn live_pods(&self) -> std::collections::HashSet<String> {
+            self.live.read().unwrap().clone()
+        }
+    }
+
+    fn liveness_managers() -> (
+        Arc<dyn RoomStore>,
+        Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    ) {
+        // NOTE: liveness is keyed by BOOT id (liveness_id), not pod name — a
+        // respawned pod-name is a different boot and must not inherit seats.
+        let live = Arc::new(std::sync::RwLock::new(
+            ["boot-a".to_string(), "boot-b".to_string()].into_iter().collect(),
+        ));
+        let inner = Arc::new(InMemoryStore::new());
+        (
+            Arc::new(LivenessStore {
+                inner,
+                live: live.clone(),
+            }),
+            live,
+        )
+    }
+
+    /// Cross-pod `kill -9` simulation: pod-a serves BOTH seats mid-game, dies
+    /// hard (drops out of `live_pods`), and pod-b's reap window must free the
+    /// seats so pod-b accepts the owner's reconnect — no waiting for the
+    /// orphan reaper, no "Seat already in use" deadlock.
+    #[tokio::test]
+    async fn test_reap_zombie_seats_cross_pod_rejoin() {
+        let (store, live) = liveness_managers();
+        let pod_a = RoomManager::new(store.clone(), "pod-a".into(), "boot-a".into(), 6, 0, 30, 15);
+        let pod_b = RoomManager::new(store.clone(), "pod-b".into(), "boot-b".into(), 6, 0, 30, 15);
+
+        // Pod-a serves both connections (that's the whole point: one pod,
+        // two seats, all stamped `owned_by_pod = Some("pod-a")`).
+        let (code, _, created) = pod_a.create_room("Alice".to_string(), true).await;
+        let alice_token = match created {
+            ServerMsg::Created { token, .. } => token,
+            _ => panic!("create should reply Created"),
+        };
+        let joined = pod_a.join_room(&code, "Bob".to_string()).await.unwrap();
+        let bob_token = match joined {
+            ServerMsg::Joined { token, .. } => token,
+            _ => panic!("join should reply Joined"),
+        };
+        pod_a.ready_player(&code, 0, true).await.unwrap();
+        pod_a.ready_player(&code, 1, true).await.unwrap();
+        pod_a.start_game(&code, 0).await.unwrap();
+
+        // Both pods alive: the reaper must NOT touch anything (no false
+        // positive while the owner is still heartbeating).
+        assert_eq!(pod_b.reap_zombie_seats().await, 0);
+        let room = pod_a.get_room(&code).await.unwrap();
+        assert!(room.players[0].connected);
+        assert!(room.players[1].connected);
+
+        // Pod-a dies hard: its heartbeat key expires, it vanishes from
+        // live_pods. No leave_room ran, so both seats are still
+        // `connected: true` with tokens intact.
+        live.write().unwrap().remove("boot-a");
+
+        // Pod-b's next tick reaps exactly the two zombie seats.
+        assert_eq!(pod_b.reap_zombie_seats().await, 2);
+
+        let room = pod_b.get_room(&code).await.unwrap();
+        for p in &room.players {
+            assert!(p.is_bot, "reaped seat must be bot-ified, got {:?}", p.name);
+            assert!(p.owned_by_pod.is_none());
+        }
+        // CRITICAL: the tokens must be registered in disconnected_players —
+        // bot-ifying without them would destroy the reclaim window.
+        assert!(room
+            .disconnected_players
+            .iter()
+            .any(|(_, t, _)| t == &alice_token));
+        assert!(room
+            .disconnected_players
+            .iter()
+            .any(|(_, t, _)| t == &bob_token));
+
+        // The owner reconnects (now served by pod-b) and gets back the seat.
+        let rejoined = pod_b
+            .rejoin_room(&code, "Alice", &alice_token)
+            .await
+            .expect("reconnect must succeed — was the seat_in_use deadlock");
+        match rejoined {
+            ServerMsg::Rejoined { player_id, .. } => assert_eq!(player_id, 0),
+            other => panic!("expected Rejoined, got {:?}", other),
+        }
+        let room = pod_b.get_room(&code).await.unwrap();
+        assert!(!room.players[0].is_bot);
+        assert_eq!(room.players[0].name, "Alice");
+        // Rejoined via pod-b => stamped with pod-b's BOOT id (liveness id),
+        // not the pod name.
+        assert_eq!(room.players[0].owned_by_pod.as_deref(), Some("boot-b"));
+
+        // Bob reconnects too — the OTHER seat was freed as well.
+        pod_b
+            .rejoin_room(&code, "Bob", &bob_token)
+            .await
+            .expect("second seat must be reconnectable");
     }
 }

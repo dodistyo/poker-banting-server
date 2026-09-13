@@ -231,6 +231,8 @@ async fn test_room_create_and_join() {
     let rm = RoomManager::new(
         Arc::new(InMemoryStore::new()),
         "test".to_string(),
+
+        "test".to_string(),
         6,
         2500,
         30,
@@ -254,6 +256,8 @@ async fn test_room_max_players() {
     let rm = RoomManager::new(
         Arc::new(InMemoryStore::new()),
         "test".to_string(),
+
+        "test".to_string(),
         6,
         2500,
         30,
@@ -273,6 +277,8 @@ async fn test_room_max_players() {
 async fn test_room_leave_marks_disconnected() {
     let rm = RoomManager::new(
         Arc::new(InMemoryStore::new()),
+        "test".to_string(),
+
         "test".to_string(),
         6,
         2500,
@@ -298,6 +304,8 @@ async fn test_room_leave_marks_disconnected() {
 async fn test_room_invalid_code() {
     let rm = RoomManager::new(
         Arc::new(InMemoryStore::new()),
+        "test".to_string(),
+
         "test".to_string(),
         6,
         2500,

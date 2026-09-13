@@ -133,6 +133,23 @@ pub trait RoomStore: Send + Sync {
     /// Redis mode: `PUBLISH room:events:{code}` so every other connected pod
     /// re-broadcasts to ITS local sessions.
     async fn publish(&self, code: &str, pod: &str, msg: &ServerMsg);
+
+    /// Record that this process is alive by (re)setting `pod:alive:{boot_id}`
+    /// with a TTL (`boot_id` is unique per process boot, NOT the pod name).
+    /// Called from the per-pod tick loop, so a crashed process's key simply
+    /// expires after the TTL — no cleanup message needed. The seat-liveness
+    /// reaper (`RoomManager::reap_zombie_seats`) then frees any seat whose
+    /// `owned_by_pod` points at a boot that is no longer in [`live_pods`].
+    ///
+    /// Memory mode: no-op (a single process can't crash out from under its
+    /// own tick loop, so every seat is trivially "alive").
+    async fn heartbeat(&self);
+
+    /// The set of pod ids currently alive (heartbeat key not yet expired).
+    /// Used by the reaper to decide which `owned_by_pod` values are still
+    /// trustworthy. Memory mode: a single sentinel, so a seat stamped with
+    /// this pod's id is never considered stale.
+    async fn live_pods(&self) -> std::collections::HashSet<String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +233,21 @@ impl RoomStore for InMemoryStore {
         // No-op: in-memory mode is a single process, the mutation already
         // delivered to the local sessions via RoomManager::broadcast_local.
     }
+
+    async fn heartbeat(&self) {
+        // No-op: a single process can't crash out from under its own tick
+        // loop, so every seat it owns is always "alive".
+    }
+
+    async fn live_pods(&self) -> std::collections::HashSet<String> {
+        // A single sentinel. In-memory seats are stamped with this pod's id
+        // (whatever the test harness passes), and the reaper only runs in
+        // Redis mode anyway — but returning a non-empty set keeps the
+        // invariant "my own seat is always live" true here too.
+        let mut s = std::collections::HashSet::new();
+        s.insert("memory".to_string());
+        s
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +270,23 @@ pub struct RedisStore {
     /// save, so an abandoned room's state eventually expires even if the
     /// orphan reaper is down.
     room_ttl_ms: u64,
+    /// TTL (ms) for the pod liveness key `pod:alive:{boot_id}`. Refreshed
+    /// every tick (1s), so a crashed process's key dies within this window
+    /// and the seat-liveness reaper frees its seats shortly after. Must be a
+    /// multiple of several ticks with comfortable margin.
+    pod_alive_ttl_ms: u64,
+    /// Identity for the ADVISORY LOCK: the pod name (`POD_NAME`/hostname) —
+    /// the lock value is informational, and auto-expiry via TTL is what
+    /// actually releases it.
     pod_id: String,
+    /// Identity for the LIVENESS key: unique per PROCESS (not per pod name).
+    /// A `kill -9`'d container respawned under the SAME `POD_NAME` must NOT
+    /// inherit the dead process's liveness — its seats are only reclaimable
+    /// once the OLD boot's key expires. If liveness were keyed by pod name,
+    /// the fresh process would refresh the still-live key, every seat it ever
+    /// served would look "owned by a live pod", and the reaper would never
+    /// fire — exactly the deadlock this feature exists to kill.
+    boot_id: String,
 }
 
 impl RedisStore {
@@ -246,13 +294,17 @@ impl RedisStore {
         conn: redis::aio::MultiplexedConnection,
         lock_ttl_ms: u64,
         room_ttl_ms: u64,
+        pod_alive_ttl_ms: u64,
         pod_id: String,
+        boot_id: String,
     ) -> Self {
         RedisStore {
             conn,
             lock_ttl_ms,
             room_ttl_ms,
+            pod_alive_ttl_ms,
             pod_id,
+            boot_id,
         }
     }
 
@@ -260,6 +312,7 @@ impl RedisStore {
         format!("room:{}", code)
     }
     const CODES_KEY: &'static str = "room:codes";
+    const POD_ALIVE_PREFIX: &'static str = "pod:alive:";
 
     fn codes_key() -> &'static str {
         Self::CODES_KEY
@@ -403,6 +456,52 @@ impl RoomStore for RedisStore {
             eprintln!("[store] redis PUBLISH room:events:{code} failed: {e}");
         }
     }
+
+    async fn heartbeat(&self) {
+        // SET pod:alive:{pod_id} <ts> EX <ttl>. Refreshed every tick (1s) so
+        // a crashed pod's key dies within `pod_alive_ttl_ms` — the reaper
+        // then frees its seats. The value carries a timestamp for debugging.
+        let key = format!("{}{}", Self::POD_ALIVE_PREFIX, self.boot_id);
+        let r: Result<String, redis::RedisError> = redis::cmd("SET")
+            .arg(&key)
+            .arg(self.boot_id.clone())
+            .arg("EX")
+            .arg((self.pod_alive_ttl_ms / 1000).max(1))
+            .query_async(&mut self.conn.clone())
+            .await;
+        if let Err(e) = r {
+            eprintln!("[store] redis heartbeat SET {key} failed: {e}");
+        }
+    }
+
+    async fn live_pods(&self) -> std::collections::HashSet<String> {
+        // SCAN every pod:alive:* key. The fleet is small (a handful of pods),
+        // so SCAN with a generous COUNT is cheap and avoids a blocking KEYS.
+        let mut live = std::collections::HashSet::new();
+        let mut cursor = "0".to_string();
+        for _ in 0..1000 {
+            let res: (String, Vec<String>) = redis::cmd("SCAN")
+                .arg(&cursor)
+                .arg("MATCH")
+                .arg(format!("{}*", Self::POD_ALIVE_PREFIX))
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut self.conn.clone())
+                .await
+                .unwrap_or(("0".to_string(), Vec::new()));
+            for key in res.1 {
+                let id = key.strip_prefix(Self::POD_ALIVE_PREFIX).map(str::to_string);
+                if let Some(id) = id {
+                    live.insert(id);
+                }
+            }
+            cursor = res.0;
+            if cursor == "0" {
+                break;
+            }
+        }
+        live
+    }
 }
 
 impl RedisStore {
@@ -434,13 +533,17 @@ impl RedisStore {
 /// Build a store from config. `kind` is `"memory"` (default, dev-safe — no
 /// Redis required) or `"redis"`. `room_ttl_ms` is the grace TTL for room
 /// state keys (Redis mode only; the reaper's `ROOM_ORPHAN_TIMEOUT_SECS` is a
-/// separate, semantic orphan timeout).
+/// separate, semantic orphan timeout). `pod_alive_ttl_ms` is the liveness
+/// key TTL — a pod that stops heartbeating is considered dead after this
+/// window and its seats are reclaimed by the seat-liveness reaper.
 pub async fn build_store(
     kind: &str,
     redis_url: Option<&str>,
     pod_id: String,
+    boot_id: String,
     lock_ttl_ms: u64,
     room_ttl_ms: u64,
+    pod_alive_ttl_ms: u64,
 ) -> Result<Arc<dyn RoomStore>, String> {
     match kind.trim().to_lowercase().as_str() {
         "redis" => {
@@ -453,7 +556,14 @@ pub async fn build_store(
                 .get_multiplexed_tokio_connection()
                 .await
                 .map_err(|e| format!("failed to connect to redis: {e}"))?;
-            Ok(Arc::new(RedisStore::new(conn, lock_ttl_ms, room_ttl_ms, pod_id)))
+            Ok(Arc::new(RedisStore::new(
+                conn,
+                lock_ttl_ms,
+                room_ttl_ms,
+                pod_alive_ttl_ms,
+                pod_id,
+                boot_id,
+            )))
         }
         "memory" | "" | _ => {
             if !kind.trim().is_empty() && kind.trim().to_lowercase() != "memory" {

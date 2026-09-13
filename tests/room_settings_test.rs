@@ -14,6 +14,8 @@ fn test_manager() -> Arc<RoomManager> {
     Arc::new(RoomManager::new(
         Arc::new(InMemoryStore::new()),
         "test".to_string(),
+
+        "test".to_string(),
         6,
         0,
         30,
@@ -210,6 +212,8 @@ async fn test_watchdog_auto_moves_stalled_human() {
     // until the watchdog's real deadline fires.
     let manager = Arc::new(RoomManager::new(
         Arc::new(InMemoryStore::new()),
+        "test".to_string(),
+
         "test".to_string(),
         6,
         200,
