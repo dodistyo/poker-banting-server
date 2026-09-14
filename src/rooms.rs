@@ -1262,12 +1262,22 @@ impl RoomManager {
                     dropped, self.orphan_timeout_secs
                 );
             }
-            let seats = self.reap_zombie_seats().await;
-            if seats > 0 {
-                println!(
-                    "[reaper] reclaimed {} zombie seat(s) (owning pod stopped heartbeating)",
-                    seats
-                );
+            // Gated like the on-demand reclaim path in `rejoin_room`: only a
+            // store with REAL per-process liveness (Redis) can have a seat
+            // owned by a boot that stopped heartbeating. `InMemoryStore`
+            // stamps seats with this process's real boot id but its
+            // `live_pods()` returns the constant sentinel {"memory"} —
+            // without this gate the predicate `owned_by_pod ∉ live` is TRUE
+            // for every local human seat and the reaper bot-ifies the player
+            // mid-game every ~5s (wiped a live local game on e2e).
+            if self.store.tracks_liveness() {
+                let seats = self.reap_zombie_seats().await;
+                if seats > 0 {
+                    println!(
+                        "[reaper] reclaimed {} zombie seat(s) (owning pod stopped heartbeating)",
+                        seats
+                    );
+                }
             }
         }
         TickResult { active: true }
