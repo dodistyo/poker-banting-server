@@ -40,6 +40,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use dashmap::DashSet;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
@@ -150,6 +151,14 @@ pub trait RoomStore: Send + Sync {
     /// trustworthy. Memory mode: a single sentinel, so a seat stamped with
     /// this pod's id is never considered stale.
     async fn live_pods(&self) -> std::collections::HashSet<String>;
+
+    /// Whether this backend has REAL per-process liveness (a heartbeat key
+    /// that expires on crash). Only such backends can have zombie seats —
+    /// on an in-memory store a single process can't die out from under its
+    /// own connections, so liveness-based seat reclamation must be a no-op.
+    fn tracks_liveness(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +173,11 @@ pub trait RoomStore: Send + Sync {
 /// be silently overwritten.
 pub struct InMemoryStore {
     rooms: DashMap<String, Room>,
+    /// Codes SET, mirroring Redis's `room:codes`. Kept SEPARATE from the
+    /// rooms map on purpose: a state key can TTL-expire while its code stays
+    /// in the set — exactly the dangling-code shape the reaper's SREM path
+    /// exists to clean up.
+    codes: DashSet<String>,
     /// One permit per room: exactly one task may be inside a locked step for
     /// this room at a time.
     locks: DashMap<String, Arc<Semaphore>>,
@@ -173,13 +187,22 @@ impl InMemoryStore {
     pub fn new() -> Self {
         InMemoryStore {
             rooms: DashMap::new(),
+            codes: DashSet::new(),
             locks: DashMap::new(),
         }
     }
 
-    /// Escape hatch for tests that still poke the map directly.
-    pub fn rooms_ref(&self) -> Arc<DashMap<String, Room>> {
-        Arc::new(self.rooms.clone())
+    /// Test helper: insert a code into the codes set WITHOUT a room state —
+    /// the in-memory analog of a Redis state key that TTL-expired while its
+    /// `room:codes` member survived.
+    pub fn add_test_code(&self, code: &str) {
+        self.codes.insert(code.to_uppercase());
+    }
+
+    /// Test helper: drop ONLY the room state for a code, leaving its codes-set
+    /// membership in place (TTL-expiry analog).
+    pub fn remove_test_state(&self, code: &str) {
+        self.rooms.remove(code.to_uppercase().as_str());
     }
 }
 
@@ -196,23 +219,30 @@ impl RoomStore for InMemoryStore {
     }
 
     async fn codes(&self) -> Vec<String> {
-        self.rooms.iter().map(|e| e.key().clone()).collect()
+        self.codes.iter().map(|e| e.key().clone()).collect()
     }
 
     async fn create(&self, code: &str, room: &Room) -> Result<(), String> {
-        if self.rooms.insert(code.to_string(), room.clone()).is_some() {
+        if self.rooms.insert(code.to_uppercase(), room.clone()).is_some() {
             return Err("Room already exists".to_string());
         }
+        self.codes.insert(code.to_uppercase());
         Ok(())
     }
 
     async fn save(&self, code: &str, room: &Room) {
-        self.rooms.insert(code.to_string(), room.clone());
+        self.rooms.insert(code.to_uppercase(), room.clone());
+        self.codes.insert(code.to_uppercase());
     }
 
     async fn delete(&self, code: &str) {
-        self.rooms.remove(code);
-        self.locks.remove(code);
+        // Keys are stored uppercased (RoomManager uppercases before every
+        // call); normalize here so a case mismatch can't orphan a codes-set
+        // member — the exact dangling-code leak the reaper's SREM path fixes.
+        let c = code.to_uppercase();
+        self.rooms.remove(&c);
+        self.codes.remove(&c);
+        self.locks.remove(&c);
     }
 
     async fn try_lock(&self, code: &str) -> Option<RoomLock> {
@@ -501,6 +531,10 @@ impl RoomStore for RedisStore {
             }
         }
         live
+    }
+
+    fn tracks_liveness(&self) -> bool {
+        true
     }
 }
 

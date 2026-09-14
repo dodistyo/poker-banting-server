@@ -66,6 +66,18 @@ pub struct RoomManager {
     bot_turn_delay_ms: u64,
     orphan_timeout_secs: u64,
     lobby_disconnect_timeout_secs: u64,
+    /// Ticks run since this manager was built — used to fire the reaper on a
+    /// ~5s cadence inside [`RoomManager::tick_once`]. `Arc` so `RoomManager`
+    /// stays `Clone` (the counter is shared, not copied).
+    tick_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Outcome of one pod tick.
+#[derive(Debug, Clone, Copy)]
+pub struct TickResult {
+    /// This pod did work this tick: it had at least one local WebSocket
+    /// session, so it refreshed its liveness key and drove its rooms.
+    pub active: bool,
 }
 
 impl RoomManager {
@@ -87,6 +99,7 @@ impl RoomManager {
             bot_turn_delay_ms,
             orphan_timeout_secs,
             lobby_disconnect_timeout_secs,
+            tick_counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -387,6 +400,19 @@ impl RoomManager {
     ) -> Result<ServerMsg, String> {
         let code = code.to_uppercase();
         let reply_code = code.clone();
+        // Zombie-reclaim inputs, computed BEFORE the sync lock-step closure.
+        // `tracks_liveness()` gates the whole path: only real-liveness stores
+        // (Redis) can have seats whose owner stopped heartbeating — in-memory
+        // mode reports a single sentinel pod, so the predicate is unreachable
+        // there and the path must stay off (no liveness round-trips either).
+        let can_reclaim_zombie = self.store.tracks_liveness();
+        let live = if can_reclaim_zombie {
+            self.store.live_pods().await
+        } else {
+            std::collections::HashSet::new()
+        };
+        let lobby_timeout = self.lobby_disconnect_timeout_secs;
+        let orphan_timeout = self.orphan_timeout_secs;
         let out = self
             .locked_step(&code, move |room| {
                 room.cleanup_expired_disconnected(Self::REJOIN_TIMEOUT_SECS);
@@ -409,6 +435,54 @@ impl RoomManager {
                     // Raw (un-masked) state: the caller serializes it through
                     // personalise_for_viewer, which adds handCount AND masks
                     // other hands in one JSON pass.
+                    out.reply = Some(ServerMsg::Rejoined {
+                        player_id: seat_id,
+                        state,
+                        code: reply_code,
+                        token: token.to_string(),
+                    });
+                    return Ok(out);
+                }
+
+                // Second path (on-demand zombie reclaim): the seat still looks
+                // `connected` to a pod that has STOPPED heartbeating (its
+                // boot's liveness key expired — the process was kill -9'd
+                // before the ~5s periodic reaper could free it). Free the seat
+                // through the SAME apply_seat_disconnect the graceful drop
+                // uses (which re-registers the token in disconnected_players
+                // and bot-ifies the seat), then reclaim it inline. Without
+                // this the player would deadlock on "Seat already in use by
+                // another window" until the slow orphan reaper fired. Only
+                // real-liveness stores (Redis) can have such seats — in-memory
+                // mode reports a single always-live pod, so the predicate is
+                // unreachable there.
+                let zombie_seat = if can_reclaim_zombie {
+                    room.players.iter().find(|p| {
+                        !p.is_bot
+                            && p.connected
+                            && p.token.as_deref() == Some(token)
+                            && matches!(&p.owned_by_pod, Some(owner) if !live.contains(owner))
+                    })
+                } else {
+                    None
+                };
+                if let Some(zombie) = zombie_seat {
+                    let seat_id = zombie.id;
+                    let mut out = Self::apply_seat_disconnect(
+                        room,
+                        seat_id,
+                        lobby_timeout,
+                        orphan_timeout,
+                    )
+                    .unwrap_or_default();
+                    room.restore_seat(seat_id, name, token);
+                    room.players[seat_id].owned_by_pod = Some(self.liveness_id.clone());
+                    room.human_reconnected();
+                    let state = room.state.clone();
+                    out.broadcast.push(ServerMsg::PlayerJoined {
+                        player_id: seat_id,
+                        name: name.to_string(),
+                    });
                     out.reply = Some(ServerMsg::Rejoined {
                         player_id: seat_id,
                         state,
@@ -787,6 +861,12 @@ impl RoomManager {
             let room = match self.store.get(&code).await {
                 Some(r) => r,
                 None => {
+                    // The state key TTL-expired (Redis dropped it) but the code
+                    // is STILL a member of the `room:codes` set — SADD'd once
+                    // with no TTL of its own. SREM it now: the old code did
+                    // `continue` here and leaked a SET member that burned ~8
+                    // commands/second FOREVER on every tick's re-scan.
+                    self.store.delete(&code).await;
                     self.store.unlock(&code, lock).await;
                     continue;
                 }
@@ -1123,6 +1203,74 @@ impl RoomManager {
             Err(_) => return false,
         };
         !out.broadcast.is_empty()
+    }
+
+    /// One tick for THIS pod. The pod owns its tick now (main.rs's interval
+    /// loop just calls this). A pod with no local WebSocket sessions does
+    /// ZERO store work — no liveness heartbeat, no `room:codes` scan, no
+    /// room locks — so an idle pod consumes zero Upstash commands.
+    ///
+    /// An active pod refreshes its liveness key and drives exactly the rooms
+    /// its own clients sit in (its local session map — in-memory, no Redis).
+    /// The old loop scanned the GLOBAL codes set every second and drove
+    /// every room on every pod; that is what burned ~2.8 commands/s per
+    /// idle pod. Rooms whose clients are gone stop being driven here — they
+    /// are orphaned (no human can watch them) and are dropped either by an
+    /// active pod's periodic reaper or by the store's own key TTL.
+    /// Run ONE tick for this pod: the only Redis work a pod does is here.
+    ///
+    /// **Idle gate:** a pod with NO local WebSocket sessions does ZERO store
+    /// work — no liveness heartbeat, no room-codes scan, no room locks. That
+    /// is what makes an idle pod cost 0 Upstash commands (previously every
+    /// pod burned ~2.8 cmd/s forever: 1 heartbeat/s + a full `room:codes`
+    /// scan every second).
+    ///
+    /// **Active:** refresh this pod's liveness key (so a hard crash releases
+    /// its seats), then drive ONLY the rooms this pod actually serves (from
+    /// the local session map — never a global codes scan, so rooms belonging
+    /// to other pods are untouched by this pod).
+    ///
+    /// **Reaper (~5s cadence, active pods only):** drop rooms whose last human
+    /// left (orphan timeout — also SREMs dangling codes) AND reclaim seats
+    /// whose owning pod died hard. `reap_zombie_seats` is a safe no-op on the
+    /// in-memory store (no real liveness there), so it needs no redis gate.
+    pub async fn tick_once(&self) -> TickResult {
+        if self.sessions.is_empty() {
+            return TickResult { active: false };
+        }
+        // Keep our liveness key fresh so a hard crash releases our seats
+        // (the seat-liveness reaper / on-demand reclaim key off this).
+        self.store.heartbeat().await;
+        // Drive only THIS pod's rooms — the session map is the local
+        // service set; a global codes() scan would fight other pods over
+        // locks they own.
+        let codes: Vec<String> = self.sessions.iter().map(|e| e.key().clone()).collect();
+        for code in codes {
+            let _ = self.drive_room(&code).await;
+        }
+        // Cross-pod safety net on a ~5s cadence (1s tick * 5): a dead pod's
+        // seats must be freed by SOMEBODY — any live pod can do it.
+        let tick = self
+            .tick_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if tick % 5 == 0 {
+            let dropped = self.reap_orphaned_rooms().await;
+            if dropped > 0 {
+                println!(
+                    "[reaper] dropped {} orphaned room(s) (last human gone >{}s)",
+                    dropped, self.orphan_timeout_secs
+                );
+            }
+            let seats = self.reap_zombie_seats().await;
+            if seats > 0 {
+                println!(
+                    "[reaper] reclaimed {} zombie seat(s) (owning pod stopped heartbeating)",
+                    seats
+                );
+            }
+        }
+        TickResult { active: true }
     }
 
     /// Execute one due pending action, mutating `room` and appending its
@@ -2279,5 +2427,210 @@ mod tests {
             .rejoin_room(&code, "Bob", &bob_token)
             .await
             .expect("second seat must be reconnectable");
+    }
+
+    /// Command-counting store: wraps an `InMemoryStore` and counts the
+    /// calls that translate to Redis commands in prod mode. Used to prove
+    /// the idle pod performs ZERO Redis work (heartbeat, codes-scan,
+    /// lock cycles) — Upstash's free tier bills every single command.
+    #[derive(Clone)]
+    struct CountingStore {
+        inner: Arc<InMemoryStore>,
+        heartbeats: Arc<std::sync::atomic::AtomicUsize>,
+        scans: Arc<std::sync::atomic::AtomicUsize>,
+        locks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RoomStore for CountingStore {
+        async fn get(&self, code: &str) -> Option<Room> {
+            self.inner.get(code).await
+        }
+        async fn codes(&self) -> Vec<String> {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.codes().await
+        }
+        async fn create(&self, code: &str, room: &Room) -> Result<(), String> {
+            self.inner.create(code, room).await
+        }
+        async fn save(&self, code: &str, room: &Room) {
+            self.inner.save(code, room).await
+        }
+        async fn delete(&self, code: &str) {
+            self.inner.delete(code).await
+        }
+        async fn try_lock(&self, code: &str) -> Option<RoomLock> {
+            self.locks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.try_lock(code).await
+        }
+        async fn unlock(&self, _code: &str, lock: RoomLock) {
+            self.inner.unlock(_code, lock).await
+        }
+        async fn publish(&self, code: &str, pod: &str, msg: &ServerMsg) {
+            self.inner.publish(code, pod, msg).await
+        }
+        async fn heartbeat(&self) {
+            self.heartbeats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        async fn live_pods(&self) -> std::collections::HashSet<String> {
+            self.inner.live_pods().await
+        }
+    }
+
+    /// A pod with NO local WebSocket sessions must do ZERO Redis work per
+    /// tick: no liveness heartbeat, no room-codes scan, no lock cycles.
+    /// This is what makes idle pods cost 0 Upstash commands.
+    #[tokio::test]
+    async fn test_tick_idle_pod_performs_no_redis_work() {
+        let inner = Arc::new(InMemoryStore::new());
+        let (heartbeats, scans, locks) = (
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let store = Arc::new(CountingStore {
+            inner,
+            heartbeats: heartbeats.clone(),
+            scans: scans.clone(),
+            locks: locks.clone(),
+        });
+        let idle_pod = RoomManager::new(store.clone(), "idle-pod".into(), "boot-idle".into(), 6, 0, 30, 15);
+
+        // A room exists in the shared store (e.g. another pod's game) —
+        // but this pod has no client in it, so it must NOT drive it.
+        let (code, _, created) = idle_pod.create_room("Alice".to_string(), true).await;
+        match created {
+            ServerMsg::Created { .. } => {}
+            other => panic!("expected Created, got {other:?}"),
+        }
+        // Simulate the client connecting to THIS pod: a live session lands in
+        // the pod's session map (ws.rs does exactly this on connect). While it
+        // exists the pod must drive the room. NOTE: remove_session matches by
+        // Arc identity (ptr_eq), so the exact Arc we hand in is the one we
+        // remove with later.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let alice_sender: SessionSender = Arc::new(tx);
+        idle_pod.add_session(code.clone(), 0, alice_sender.clone());
+        {
+            let res = idle_pod.tick_once().await;
+            assert!(res.active, "pod with a local session must be active");
+        }
+        // Simulate the client closing its socket: ws.rs calls remove_session,
+        // so no local session remains — the idle gate must flip OFF.
+        idle_pod.remove_session(&code, &alice_sender);
+
+        // Snapshot the store traffic. The earlier ACTIVE tick legitimately
+        // heartbeated + took a room lock; the contract under test is that the
+        // IDLE phase adds ZERO store work on top of that.
+        let hb_idle = heartbeats.load(std::sync::atomic::Ordering::SeqCst);
+        let sc_idle = scans.load(std::sync::atomic::Ordering::SeqCst);
+        let lk_idle = locks.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Several ticks (the main.rs interval loop's job, now in the pod).
+        for _ in 0..7 {
+            let res = idle_pod.tick_once().await;
+            assert!(!res.active, "pod with no sessions must be idle");
+        }
+
+        assert_eq!(heartbeats.load(std::sync::atomic::Ordering::SeqCst), hb_idle,
+            "idle pod must not refresh its liveness key");
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), sc_idle,
+            "idle pod must not scan room:codes");
+        assert_eq!(locks.load(std::sync::atomic::Ordering::SeqCst), lk_idle,
+            "idle pod must not take room locks");
+
+        // Now a client connects again: the SAME pod must drive the room
+        // (bots keep moving) — the gate flips back on.
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let bob_sender: SessionSender = Arc::new(tx2);
+        idle_pod.add_session(code.clone(), 1, bob_sender);
+        let res = idle_pod.tick_once().await;
+        assert!(res.active, "pod with a local session must be active");
+        assert!(heartbeats.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "active pod must heartbeat");
+    }
+
+    /// The room-key TTL can expire while the code stays in the `room:codes`
+    /// set (the old reaper did `get -> None -> continue`, never SREMed).
+    /// Such dangling codes burned ~8 commands/second FOREVER. The reaper
+    /// must now SREM them (delete() = DEL + SREM, idempotent).
+    #[tokio::test]
+    async fn test_reaper_srem_dangling_code() {
+        let inner = Arc::new(InMemoryStore::new());
+        let store = Arc::new(CountingStore {
+            inner: inner.clone(),
+            heartbeats: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            scans: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            locks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let manager = RoomManager::new(store, "pod-a".into(), "boot-a".into(), 6, 0, 30, 15);
+
+        // A real room that must SURVIVE the reap.
+        let (code, _, created) = manager.create_room("Alice".to_string(), true).await;
+        match created {
+            ServerMsg::Created { .. } => {}
+            other => panic!("expected Created, got {other:?}"),
+        }
+        // A DANGLING code: in the codes set, no state key — the in-memory
+        // analog of a Redis state key that TTL-expired while its room:codes
+        // member survived. `add_test_code` builds exactly this shape.
+        inner.add_test_code("ZOMBIE");
+        assert!(
+            inner.codes().await.iter().any(|c| *c == "ZOMBIE"),
+            "dangling code must be listed before reap"
+        );
+
+        let dropped = manager.reap_orphaned_rooms().await;
+        assert_eq!(dropped, 0, "a dangling code is not an orphaned room (no state)");
+        assert!(
+            !inner.codes().await.iter().any(|c| *c == "ZOMBIE"),
+            "dangling code must be SREMed — it was the 8 cmd/s forever leak"
+        );
+        assert!(
+            inner.codes().await.iter().any(|c| *c == code.to_uppercase()),
+            "the live room's code must survive the reap"
+        );
+    }
+
+    /// A room whose LAST HUMAN left (now bot-driven) is orphaned after the
+    /// orphan timeout — even though `last_human_disconnect_at` was stamped
+    /// at leave, no connected human remains for anyone to reap it from.
+    /// Covers the 26h-loadtest case where bot rooms lived until TTL expiry.
+    #[tokio::test]
+    async fn test_bot_only_room_reaped_after_orphan_timeout() {
+        let store = Arc::new(InMemoryStore::new());
+        let manager = RoomManager::new(store.clone(), "pod-a".into(), "boot-a".into(), 6, 0, 30, 15);
+        let (code, _, created) = manager.create_room("Alice".to_string(), false).await;
+        match created {
+            ServerMsg::Created { .. } => {}
+            other => panic!("expected Created, got {other:?}"),
+        }
+        manager
+            .join_room(&code, "Bob".to_string())
+            .await
+            .unwrap();
+        manager.ready_player(&code, 0, true).await.unwrap();
+        manager.ready_player(&code, 1, true).await.unwrap();
+        manager.start_game(&code, 0).await.unwrap();
+
+        // The LAST human disconnects (graceful): the seat becomes a bot, the
+        // disconnect timer starts, the game continues bot-vs-bot.
+        manager.leave_room(&code, 0).await;
+        // ...and the second human too, so NO connected human remains for
+        // anyone to reap the room from — this is the 26h-loadtest case where
+        // bot-only rooms lived until TTL expiry.
+        manager.leave_room(&code, 1).await;
+
+        // Before the timeout: NOT reaped (bots still have a game running).
+        assert_eq!(manager.reap_orphaned_rooms().await, 0);
+        assert!(store.get(&code).await.is_some());
+
+        // Fast-forward past the 30s orphan timeout.
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        assert_eq!(manager.reap_orphaned_rooms().await, 1,
+            "bot-only room must be dropped once the orphan timeout matures");
+        assert!(store.get(&code).await.is_none(), "state key must be deleted");
+        assert!(!store.codes().await.iter().any(|c| *c == code),
+            "code must be SREMed with the room");
     }
 }
